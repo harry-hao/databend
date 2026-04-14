@@ -104,6 +104,7 @@ impl From<Compression> for crate::meta::Compression {
 pub enum ColumnMeta {
     Parquet(ParquetColumnMeta),
     Native(NativeColumnMeta),
+    Vortex(VortexColumnMeta),
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -143,6 +144,24 @@ impl From<ColumnMeta> for crate::meta::ColumnMeta {
         match value {
             ColumnMeta::Parquet(v) => Self::Parquet(v.into()),
             ColumnMeta::Native(v) => Self::Native(v.into()),
+            ColumnMeta::Vortex(v) => Self::Vortex(v.into()),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct VortexColumnMeta {
+    pub offset: u64,
+    pub len: u64,
+    pub num_values: u64,
+}
+
+impl From<VortexColumnMeta> for crate::meta::v0::ColumnMeta {
+    fn from(value: VortexColumnMeta) -> Self {
+        Self {
+            offset: value.offset,
+            len: value.len,
+            num_values: value.num_values,
         }
     }
 }

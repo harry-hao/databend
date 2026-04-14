@@ -149,10 +149,11 @@ impl SegmentBuilder for ColumnOrientedSegmentBuilder {
             col_stat.distinct_of_values.push(stat.distinct_of_values);
         }
         for (col_id, col_meta) in self.column_meta.iter_mut() {
-            let meta = &block_meta.col_metas[col_id].as_parquet().unwrap();
-            col_meta.offset.push(meta.offset);
-            col_meta.length.push(meta.len);
-            col_meta.num_values.push(meta.num_values);
+            let m = &block_meta.col_metas[col_id];
+            let (offset, len) = m.offset_length();
+            col_meta.offset.push(offset);
+            col_meta.length.push(len);
+            col_meta.num_values.push(m.read_rows(None));
         }
         Ok(())
     }

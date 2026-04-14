@@ -1,0 +1,330 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+use vortex_dtype::{DType, Nullability, PType};
+use vortex_error::{VortexExpect as _, VortexUnwrap, vortex_panic};
+use vortex_scalar::Scalar;
+
+use crate::Array;
+use crate::compute::{MinMaxResult, cast, min_max};
+
+/// Test conformance of the cast compute function for an array.
+///
+/// This function tests various casting scenarios including:
+/// - Casting between numeric types (widening and narrowing)
+/// - Casting between signed and unsigned types
+/// - Casting between integral and floating-point types
+/// - Casting with nullability changes
+/// - Casting between string types (Utf8/Binary)
+/// - Edge cases like overflow behavior
+pub fn test_cast_conformance(array: &dyn Array) {
+    let dtype = array.dtype();
+
+    // Always test identity cast and nullability changes
+    test_cast_identity(array);
+
+    test_cast_to_non_nullable(array);
+    test_cast_to_nullable(array);
+
+    // Test based on the specific DType
+    match dtype {
+        DType::Null => test_cast_from_null(array),
+        DType::Primitive(ptype, ..) => match ptype {
+            PType::U8
+            | PType::U16
+            | PType::U32
+            | PType::U64
+            | PType::I8
+            | PType::I16
+            | PType::I32
+            | PType::I64 => test_cast_to_integral_types(array),
+            PType::F16 | PType::F32 | PType::F64 => test_cast_from_floating_point_types(array),
+        },
+        _ => {}
+    }
+}
+
+fn test_cast_identity(array: &dyn Array) {
+    // Casting to the same type should be a no-op
+    let result = cast(array, array.dtype()).vortex_unwrap();
+    assert_eq!(result.len(), array.len());
+    assert_eq!(result.dtype(), array.dtype());
+
+    // Verify values are unchanged
+    for i in 0..array.len().min(10) {
+        assert_eq!(array.scalar_at(i), result.scalar_at(i));
+    }
+}
+
+fn test_cast_from_null(array: &dyn Array) {
+    // Null can be cast to itself
+    let result = cast(array, &DType::Null).vortex_unwrap();
+    assert_eq!(result.len(), array.len());
+    assert_eq!(result.dtype(), &DType::Null);
+
+    // Null can also be cast to any nullable type
+    let nullable_types = vec![
+        DType::Bool(Nullability::Nullable),
+        DType::Primitive(PType::I32, Nullability::Nullable),
+        DType::Primitive(PType::F64, Nullability::Nullable),
+        DType::Utf8(Nullability::Nullable),
+        DType::Binary(Nullability::Nullable),
+    ];
+
+    for dtype in nullable_types {
+        let result = cast(array, &dtype).vortex_unwrap();
+        assert_eq!(result.len(), array.len());
+        assert_eq!(result.dtype(), &dtype);
+
+        // Verify all values are null
+        for i in 0..array.len().min(10) {
+            assert!(result.scalar_at(i).is_null());
+        }
+    }
+
+    // Casting to non-nullable types should fail
+    let non_nullable_types = vec![
+        DType::Bool(Nullability::NonNullable),
+        DType::Primitive(PType::I32, Nullability::NonNullable),
+    ];
+
+    for dtype in non_nullable_types {
+        assert!(cast(array, &dtype).is_err());
+    }
+}
+
+fn test_cast_to_non_nullable(array: &dyn Array) {
+    if array.invalid_count() == 0 {
+        let non_nullable = cast(array, &array.dtype().as_nonnullable())
+            .vortex_expect("arrays without nulls can cast to non-nullable");
+        assert_eq!(non_nullable.dtype(), &array.dtype().as_nonnullable());
+        assert_eq!(non_nullable.len(), array.len());
+
+        for i in 0..array.len().min(10) {
+            assert_eq!(array.scalar_at(i), non_nullable.scalar_at(i));
+        }
+
+        let back_to_nullable = cast(&non_nullable, array.dtype())
+            .vortex_expect("non-nullable arrays can cast to nullable");
+        assert_eq!(back_to_nullable.dtype(), array.dtype());
+        assert_eq!(back_to_nullable.len(), array.len());
+
+        for i in 0..array.len().min(10) {
+            assert_eq!(array.scalar_at(i), back_to_nullable.scalar_at(i));
+        }
+    } else {
+        if &DType::Null == array.dtype() {
+            // DType::Null.as_nonnullable() (confusingly) returns DType:Null. Of course, a null
+            // array can be casted to DType::Null.
+            return;
+        }
+        cast(array, &array.dtype().as_nonnullable())
+            .err()
+            .unwrap_or_else(|| {
+                vortex_panic!(
+                    "arrays with nulls should error when casting to non-nullable {}",
+                    array,
+                )
+            });
+    }
+}
+
+fn test_cast_to_nullable(array: &dyn Array) {
+    let nullable = cast(array, &array.dtype().as_nullable())
+        .vortex_expect("arrays without nulls can cast to nullable");
+    assert_eq!(nullable.dtype(), &array.dtype().as_nullable());
+    assert_eq!(nullable.len(), array.len());
+
+    for i in 0..array.len().min(10) {
+        assert_eq!(array.scalar_at(i), nullable.scalar_at(i));
+    }
+
+    let back = cast(&nullable, array.dtype())
+        .vortex_expect("casting to nullable and back should be a no-op");
+    assert_eq!(back.dtype(), array.dtype());
+    assert_eq!(back.len(), array.len());
+
+    for i in 0..array.len().min(10) {
+        assert_eq!(array.scalar_at(i), back.scalar_at(i));
+    }
+}
+
+fn test_cast_from_floating_point_types(array: &dyn Array) {
+    let ptype = array.as_primitive_typed().ptype();
+    test_cast_to_primitive(array, PType::I8, false);
+    test_cast_to_primitive(array, PType::U8, false);
+    test_cast_to_primitive(array, PType::I16, false);
+    test_cast_to_primitive(array, PType::U16, false);
+    test_cast_to_primitive(array, PType::I32, false);
+    test_cast_to_primitive(array, PType::U32, false);
+    test_cast_to_primitive(array, PType::I64, false);
+    test_cast_to_primitive(array, PType::U64, false);
+    test_cast_to_primitive(array, PType::F16, matches!(ptype, PType::F16));
+    test_cast_to_primitive(array, PType::F32, matches!(ptype, PType::F16 | PType::F32));
+    test_cast_to_primitive(array, PType::F64, true);
+}
+
+fn test_cast_to_integral_types(array: &dyn Array) {
+    test_cast_to_primitive(array, PType::I8, true);
+    test_cast_to_primitive(array, PType::U8, true);
+    test_cast_to_primitive(array, PType::I16, true);
+    test_cast_to_primitive(array, PType::U16, true);
+    test_cast_to_primitive(array, PType::I32, true);
+    test_cast_to_primitive(array, PType::U32, true);
+    test_cast_to_primitive(array, PType::I64, true);
+    test_cast_to_primitive(array, PType::U64, true);
+}
+
+/// Does this scalar fit in this type?
+fn fits(value: &Scalar, ptype: PType) -> bool {
+    let dtype = DType::Primitive(ptype, value.dtype().nullability());
+    value.cast(&dtype).is_ok()
+}
+
+fn test_cast_to_primitive(array: &dyn Array, target_ptype: PType, test_round_trip: bool) {
+    let maybe_min_max = min_max(array).vortex_unwrap();
+
+    if let Some(MinMaxResult { min, max }) = maybe_min_max
+        && (!fits(&min, target_ptype) || !fits(&max, target_ptype))
+    {
+        cast(
+            array,
+            &DType::Primitive(target_ptype, array.dtype().nullability()),
+        )
+        .err()
+        .unwrap_or_else(|| {
+            vortex_panic!(
+                "Cast must fail because some values are out of bounds. {} {:?} {:?} {} {}",
+                target_ptype,
+                min,
+                max,
+                array,
+                array.display_values(),
+            )
+        });
+        return;
+    }
+
+    // Otherwise, all values must fit.
+    let casted = cast(
+        array,
+        &DType::Primitive(target_ptype, array.dtype().nullability()),
+    )
+    .unwrap_or_else(|e| {
+        vortex_panic!(
+            "Cast must succeed because all values are within bounds. {} {}: {e}",
+            target_ptype,
+            array.display_values(),
+        )
+    });
+    assert_eq!(array.validity_mask(), casted.validity_mask());
+    for i in 0..array.len().min(10) {
+        let original = array.scalar_at(i);
+        let casted = casted.scalar_at(i);
+        assert_eq!(
+            original.cast(casted.dtype()).vortex_unwrap(),
+            casted,
+            "{i} {original} {casted}"
+        );
+        if test_round_trip {
+            assert_eq!(
+                original,
+                casted.cast(original.dtype()).vortex_unwrap(),
+                "{i} {original} {casted}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_buffer::buffer;
+    use vortex_dtype::{DType, FieldNames, Nullability};
+
+    use super::*;
+    use crate::IntoArray;
+    use crate::arrays::{
+        BoolArray, ListArray, NullArray, PrimitiveArray, StructArray, VarBinArray,
+    };
+
+    #[test]
+    fn test_cast_conformance_u32() {
+        let array = buffer![0u32, 100, 200, 65535, 1000000].into_array();
+        test_cast_conformance(array.as_ref());
+    }
+
+    #[test]
+    fn test_cast_conformance_i32() {
+        let array = buffer![-100i32, -1, 0, 1, 100].into_array();
+        test_cast_conformance(array.as_ref());
+    }
+
+    #[test]
+    fn test_cast_conformance_f32() {
+        let array = buffer![0.0f32, 1.5, -2.5, 100.0, 1e6].into_array();
+        test_cast_conformance(array.as_ref());
+    }
+
+    #[test]
+    fn test_cast_conformance_nullable() {
+        let array = PrimitiveArray::from_option_iter([Some(1u8), None, Some(255), Some(0), None]);
+        test_cast_conformance(array.as_ref());
+    }
+
+    #[test]
+    fn test_cast_conformance_bool() {
+        let array = BoolArray::from_iter(vec![true, false, true, false]);
+        test_cast_conformance(array.as_ref());
+    }
+
+    #[test]
+    fn test_cast_conformance_null() {
+        let array = NullArray::new(5);
+        test_cast_conformance(array.as_ref());
+    }
+
+    #[test]
+    fn test_cast_conformance_utf8() {
+        let array = VarBinArray::from_iter(
+            vec![Some("hello"), None, Some("world")],
+            DType::Utf8(Nullability::Nullable),
+        );
+        test_cast_conformance(array.as_ref());
+    }
+
+    #[test]
+    fn test_cast_conformance_binary() {
+        let array = VarBinArray::from_iter(
+            vec![Some(b"data".as_slice()), None, Some(b"bytes".as_slice())],
+            DType::Binary(Nullability::Nullable),
+        );
+        test_cast_conformance(array.as_ref());
+    }
+
+    #[test]
+    fn test_cast_conformance_struct() {
+        let names = FieldNames::from(["a", "b"]);
+
+        let a = buffer![1i32, 2, 3].into_array();
+        let b = VarBinArray::from_iter(
+            vec![Some("x"), None, Some("z")],
+            DType::Utf8(Nullability::Nullable),
+        )
+        .into_array();
+
+        let array =
+            StructArray::try_new(names, vec![a, b], 3, crate::validity::Validity::NonNullable)
+                .unwrap();
+        test_cast_conformance(array.as_ref());
+    }
+
+    #[test]
+    fn test_cast_conformance_list() {
+        let data = buffer![1i32, 2, 3, 4, 5, 6].into_array();
+        let offsets = buffer![0i64, 2, 2, 5, 6].into_array();
+
+        let array =
+            ListArray::try_new(data, offsets, crate::validity::Validity::NonNullable).unwrap();
+        test_cast_conformance(array.as_ref());
+    }
+}

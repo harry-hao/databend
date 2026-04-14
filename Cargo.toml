@@ -493,6 +493,7 @@ unicode-segmentation = "1.10.1"
 unindent = "0.2"
 url = "2.5.4"
 uuid = { version = "1.10.0", features = ["std", "serde", "v4", "v7"] }
+vortex = { version = "0.56.0", features = ["tokio"] }
 volo-thrift = "0.10"
 walkdir = "2.3.2"
 wiremock = "0.6"
@@ -607,6 +608,8 @@ overflow-checks = true
 rpath = true
 
 [patch.crates-io]
+# Patched vortex-array 0.56.0: explicit Result type in expr/display.rs (fixes E0282/E0283 on nightly).
+vortex-array = { path = "vendor/vortex-array" }
 arrow-udf-runtime = { git = "https://github.com/datafuse-extras/arrow-udf.git", rev = "2480dccf1" }
 async-backtrace = { git = "https://github.com/datafuse-extras/async-backtrace.git", rev = "dea4553" }
 async-recursion = { git = "https://github.com/datafuse-extras/async-recursion.git", rev = "a353334" }

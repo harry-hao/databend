@@ -44,6 +44,7 @@ arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
 async-backtrace = { workspace = true }
 async-channel = { workspace = true }
 async-trait = { workspace = true }
@@ -81,6 +82,7 @@ thrift = { workspace = true }
 tokio = { workspace = true }
 typetag = { workspace = true }
 uuid = { workspace = true }
+vortex = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }

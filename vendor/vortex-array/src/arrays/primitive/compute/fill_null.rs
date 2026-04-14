@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+use std::ops::Not;
+
+use vortex_dtype::match_each_native_ptype;
+use vortex_error::{VortexExpect, VortexResult};
+use vortex_scalar::Scalar;
+
+use crate::arrays::PrimitiveVTable;
+use crate::arrays::primitive::PrimitiveArray;
+use crate::compute::{FillNullKernel, FillNullKernelAdapter};
+use crate::validity::Validity;
+use crate::vtable::ValidityHelper;
+use crate::{ArrayRef, IntoArray, ToCanonical, register_kernel};
+
+impl FillNullKernel for PrimitiveVTable {
+    fn fill_null(&self, array: &PrimitiveArray, fill_value: &Scalar) -> VortexResult<ArrayRef> {
+        let result_validity = Validity::from(fill_value.dtype().nullability());
+
+        Ok(match array.validity() {
+            Validity::Array(is_valid) => {
+                let is_invalid = is_valid.to_bool().bit_buffer().not();
+                match_each_native_ptype!(array.ptype(), |T| {
+                    let mut buffer = array.buffer::<T>().into_mut();
+                    let fill_value = fill_value
+                        .as_primitive()
+                        .typed_value::<T>()
+                        .vortex_expect("top-level fill_null ensure non-null fill value");
+                    for invalid_index in is_invalid.set_indices() {
+                        buffer[invalid_index] = fill_value;
+                    }
+                    PrimitiveArray::new(buffer.freeze(), result_validity).into_array()
+                })
+            }
+            _ => unreachable!("checked in entry point"),
+        })
+    }
+}
+
+register_kernel!(FillNullKernelAdapter(PrimitiveVTable).lift());
+
+#[cfg(test)]
+mod test {
+    use vortex_buffer::buffer;
+    use vortex_scalar::Scalar;
+
+    use crate::IntoArray;
+    use crate::arrays::BoolArray;
+    use crate::arrays::primitive::PrimitiveArray;
+    use crate::canonical::ToCanonical;
+    use crate::compute::fill_null;
+    use crate::validity::Validity;
+
+    #[test]
+    fn fill_null_leading_none() {
+        let arr = PrimitiveArray::from_option_iter([None, Some(8u8), None, Some(10), None]);
+        let p = fill_null(arr.as_ref(), &Scalar::from(42u8))
+            .unwrap()
+            .to_primitive();
+        assert_eq!(p.as_slice::<u8>(), vec![42, 8, 42, 10, 42]);
+        assert!(p.validity_mask().all_true());
+    }
+
+    #[test]
+    fn fill_null_all_none() {
+        let arr = PrimitiveArray::from_option_iter([Option::<u8>::None, None, None, None, None]);
+
+        let p = fill_null(arr.as_ref(), &Scalar::from(255u8))
+            .unwrap()
+            .to_primitive();
+        assert_eq!(p.as_slice::<u8>(), vec![255, 255, 255, 255, 255]);
+        assert!(p.validity_mask().all_true());
+    }
+
+    #[test]
+    fn fill_null_nullable_non_null() {
+        let arr = PrimitiveArray::new(
+            buffer![8u8, 10, 12, 14, 16],
+            Validity::Array(BoolArray::from_iter([true, true, true, true, true]).into_array()),
+        );
+        let p = fill_null(arr.as_ref(), &Scalar::from(255u8))
+            .unwrap()
+            .to_primitive();
+        assert_eq!(p.as_slice::<u8>(), vec![8, 10, 12, 14, 16]);
+        assert!(p.validity_mask().all_true());
+    }
+
+    #[test]
+    fn fill_null_non_nullable() {
+        let arr = buffer![8u8, 10, 12, 14, 16].into_array();
+        let p = fill_null(&arr, &Scalar::from(255u8))
+            .unwrap()
+            .to_primitive();
+        assert_eq!(p.as_slice::<u8>(), vec![8u8, 10, 12, 14, 16]);
+        assert!(p.validity_mask().all_true());
+    }
+}

@@ -1,0 +1,1833 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+use std::cmp::Ordering;
+use std::fmt::Debug;
+use std::hash::Hash;
+use std::ops::Range;
+
+use itertools::Itertools;
+use num_traits::NumCast;
+use vortex_buffer::{BitBuffer, BufferMut};
+use vortex_dtype::Nullability::NonNullable;
+use vortex_dtype::{
+    DType, IntegerPType, NativePType, PType, UnsignedPType, match_each_integer_ptype,
+    match_each_unsigned_integer_ptype,
+};
+use vortex_error::{
+    VortexError, VortexExpect, VortexResult, vortex_bail, vortex_err, vortex_panic,
+};
+use vortex_mask::{AllOr, Mask};
+use vortex_scalar::{PValue, Scalar};
+use vortex_utils::aliases::hash_map::HashMap;
+
+use crate::arrays::PrimitiveArray;
+use crate::compute::{cast, filter, is_sorted, take};
+use crate::search_sorted::{SearchResult, SearchSorted, SearchSortedSide};
+use crate::vtable::ValidityHelper;
+use crate::{Array, ArrayRef, IntoArray, ToCanonical};
+
+/// One patch index offset is stored for each chunk.
+/// This allows for constant time patch index lookups.
+const PATCH_CHUNK_SIZE: usize = 1024;
+
+#[derive(Copy, Clone, prost::Message)]
+pub struct PatchesMetadata {
+    #[prost(uint64, tag = "1")]
+    len: u64,
+    #[prost(uint64, tag = "2")]
+    offset: u64,
+    #[prost(enumeration = "PType", tag = "3")]
+    indices_ptype: i32,
+    #[prost(uint64, optional, tag = "4")]
+    chunk_offsets_len: Option<u64>,
+    #[prost(enumeration = "PType", optional, tag = "5")]
+    chunk_offsets_ptype: Option<i32>,
+    #[prost(uint64, optional, tag = "6")]
+    offset_within_chunk: Option<u64>,
+}
+
+impl PatchesMetadata {
+    #[inline]
+    pub fn new(
+        len: usize,
+        offset: usize,
+        indices_ptype: PType,
+        chunk_offsets_len: Option<usize>,
+        chunk_offsets_ptype: Option<PType>,
+        offset_within_chunk: Option<usize>,
+    ) -> Self {
+        Self {
+            len: len as u64,
+            offset: offset as u64,
+            indices_ptype: indices_ptype as i32,
+            chunk_offsets_len: chunk_offsets_len.map(|len| len as u64),
+            chunk_offsets_ptype: chunk_offsets_ptype.map(|pt| pt as i32),
+            offset_within_chunk: offset_within_chunk.map(|len| len as u64),
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        usize::try_from(self.len).vortex_expect("len is a valid usize")
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub fn offset(&self) -> usize {
+        usize::try_from(self.offset).vortex_expect("offset is a valid usize")
+    }
+
+    #[inline]
+    pub fn chunk_offsets_dtype(&self) -> Option<DType> {
+        self.chunk_offsets_ptype
+            .map(|t| {
+                PType::try_from(t)
+                    .map_err(|e| vortex_err!("invalid i32 value {t} for PType: {}", e))
+                    .vortex_expect("invalid i32 value for PType")
+            })
+            .map(|ptype| DType::Primitive(ptype, NonNullable))
+    }
+
+    #[inline]
+    pub fn indices_dtype(&self) -> DType {
+        assert!(
+            self.indices_ptype().is_unsigned_int(),
+            "Patch indices must be unsigned integers"
+        );
+        DType::Primitive(self.indices_ptype(), NonNullable)
+    }
+}
+
+/// A helper for working with patched arrays.
+#[derive(Debug, Clone)]
+pub struct Patches {
+    array_len: usize,
+    offset: usize,
+    indices: ArrayRef,
+    values: ArrayRef,
+    /// Stores the patch index offset for each chunk.
+    chunk_offsets: Option<ArrayRef>,
+    /// Chunk offsets are only sliced off in case the slice is fully
+    /// outside of the chunk range.
+    ///
+    /// Though the range for indices and values is sliced in terms of
+    /// individual elements, not chunks. To account for that we do a
+    /// saturating sub when adjusting the indices based on the chunk offset.
+    //
+    /// `offset_within_chunk` is necessary in order to keep track of how many
+    /// elements were sliced off within the chunk.
+    offset_within_chunk: Option<usize>,
+}
+
+impl Patches {
+    pub fn new(
+        array_len: usize,
+        offset: usize,
+        indices: ArrayRef,
+        values: ArrayRef,
+        chunk_offsets: Option<ArrayRef>,
+    ) -> Self {
+        assert_eq!(
+            indices.len(),
+            values.len(),
+            "Patch indices and values must have the same length"
+        );
+        assert!(
+            indices.dtype().is_unsigned_int() && !indices.dtype().is_nullable(),
+            "Patch indices must be non-nullable unsigned integers, got {:?}",
+            indices.dtype()
+        );
+        assert!(
+            indices.len() <= array_len,
+            "Patch indices must be shorter than the array length"
+        );
+        assert!(!indices.is_empty(), "Patch indices must not be empty");
+        let max = usize::try_from(&indices.scalar_at(indices.len() - 1))
+            .vortex_expect("indices must be a number");
+        assert!(
+            max - offset < array_len,
+            "Patch indices {max:?}, offset {offset} are longer than the array length {array_len}"
+        );
+
+        debug_assert!(
+            is_sorted(indices.as_ref())
+                .unwrap_or(Some(false))
+                .unwrap_or(false),
+            "Patch indices must be sorted"
+        );
+
+        Self {
+            array_len,
+            offset,
+            indices,
+            values,
+            chunk_offsets: chunk_offsets.clone(),
+            // Initialize with `Some(0)` only if `chunk_offsets` are set.
+            offset_within_chunk: chunk_offsets.map(|_| 0),
+        }
+    }
+
+    /// Construct new patches without validating any of the arguments
+    ///
+    /// # Safety
+    ///
+    /// Users have to assert that
+    /// * Indices and values have the same length
+    /// * Indices is an unsigned integer type
+    /// * Indices must be sorted
+    /// * Last value in indices is smaller than array_len
+    pub unsafe fn new_unchecked(
+        array_len: usize,
+        offset: usize,
+        indices: ArrayRef,
+        values: ArrayRef,
+        chunk_offsets: Option<ArrayRef>,
+        offset_within_chunk: Option<usize>,
+    ) -> Self {
+        Self {
+            array_len,
+            offset,
+            indices,
+            values,
+            chunk_offsets,
+            offset_within_chunk,
+        }
+    }
+
+    #[inline]
+    pub fn array_len(&self) -> usize {
+        self.array_len
+    }
+
+    #[inline]
+    pub fn num_patches(&self) -> usize {
+        self.indices.len()
+    }
+
+    #[inline]
+    pub fn dtype(&self) -> &DType {
+        self.values.dtype()
+    }
+
+    #[inline]
+    pub fn indices(&self) -> &ArrayRef {
+        &self.indices
+    }
+
+    #[inline]
+    pub fn into_indices(self) -> ArrayRef {
+        self.indices
+    }
+
+    #[inline]
+    pub fn indices_mut(&mut self) -> &mut ArrayRef {
+        &mut self.indices
+    }
+
+    #[inline]
+    pub fn values(&self) -> &ArrayRef {
+        &self.values
+    }
+
+    #[inline]
+    pub fn into_values(self) -> ArrayRef {
+        self.values
+    }
+
+    #[inline]
+    pub fn values_mut(&mut self) -> &mut ArrayRef {
+        &mut self.values
+    }
+
+    #[inline]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    #[inline]
+    pub fn chunk_offsets(&self) -> &Option<ArrayRef> {
+        &self.chunk_offsets
+    }
+
+    #[inline]
+    pub fn chunk_offset_at(&self, idx: usize) -> usize {
+        let Some(chunk_offsets) = &self.chunk_offsets else {
+            vortex_panic!("chunk_offsets must be set to retrieve offset at index")
+        };
+
+        chunk_offsets
+            .scalar_at(idx)
+            .as_primitive()
+            .as_::<usize>()
+            .vortex_expect("chunk offset must be usize")
+    }
+
+    #[inline]
+    pub fn offset_within_chunk(&self) -> Option<usize> {
+        self.offset_within_chunk
+    }
+
+    #[inline]
+    pub fn indices_ptype(&self) -> PType {
+        PType::try_from(self.indices.dtype()).vortex_expect("primitive indices")
+    }
+
+    pub fn to_metadata(&self, len: usize, dtype: &DType) -> VortexResult<PatchesMetadata> {
+        if self.indices.len() > len {
+            vortex_bail!(
+                "Patch indices {} are longer than the array length {}",
+                self.indices.len(),
+                len
+            );
+        }
+        if self.values.dtype() != dtype {
+            vortex_bail!(
+                "Patch values dtype {} does not match array dtype {}",
+                self.values.dtype(),
+                dtype
+            );
+        }
+        let chunk_offsets_len = self.chunk_offsets.as_ref().map(|co| co.len());
+        let chunk_offsets_ptype = self.chunk_offsets.as_ref().map(|co| co.dtype().as_ptype());
+
+        Ok(PatchesMetadata::new(
+            self.indices.len(),
+            self.offset,
+            self.indices.dtype().as_ptype(),
+            chunk_offsets_len,
+            chunk_offsets_ptype,
+            self.offset_within_chunk,
+        ))
+    }
+
+    pub fn cast_values(self, values_dtype: &DType) -> VortexResult<Self> {
+        // SAFETY: casting does not affect the relationship between the indices and values
+        unsafe {
+            Ok(Self::new_unchecked(
+                self.array_len,
+                self.offset,
+                self.indices,
+                cast(&self.values, values_dtype)?,
+                self.chunk_offsets,
+                self.offset_within_chunk,
+            ))
+        }
+    }
+
+    /// Get the patched value at a given index if it exists.
+    pub fn get_patched(&self, index: usize) -> Option<Scalar> {
+        self.search_index(index)
+            .to_found()
+            .map(|patch_idx| self.values().scalar_at(patch_idx))
+    }
+
+    /// Searches for `index` in the indices array.
+    ///
+    /// Chooses between chunked search when [`Self::chunk_offsets`] is
+    /// available, and binary search otherwise. The `index` parameter is
+    /// adjusted by [`Self::offset`] for both.
+    ///
+    /// # Arguments
+    /// * `index` - The index to search for
+    ///
+    /// # Returns
+    /// * [`SearchResult::Found(patch_idx)`] - If a patch exists at this index, returns the
+    ///   position in the patches array
+    /// * [`SearchResult::NotFound(insertion_point)`] - If no patch exists, returns where
+    ///   a patch at this index would be inserted to maintain sorted order
+    pub fn search_index(&self, index: usize) -> SearchResult {
+        if self.chunk_offsets.is_some() {
+            return self.search_index_chunked(index);
+        }
+
+        Self::search_index_binary_search(&self.indices, index + self.offset)
+    }
+
+    /// Binary searches for `needle` in the indices array.
+    ///
+    /// # Returns
+    /// [`SearchResult::Found`] with the position if needle exists, or [`SearchResult::NotFound`]
+    /// with the insertion point if not found.
+    fn search_index_binary_search(indices: &dyn Array, needle: usize) -> SearchResult {
+        if indices.is_canonical() {
+            let primitive = indices.to_primitive();
+            match_each_integer_ptype!(primitive.ptype(), |T| {
+                let Ok(needle) = T::try_from(needle) else {
+                    // If the needle is not of type T, then it cannot possibly be in this array.
+                    //
+                    // The needle is a non-negative integer (a usize); therefore, it must be larger
+                    // than all values in this array.
+                    return SearchResult::NotFound(primitive.len());
+                };
+                return primitive
+                    .as_slice::<T>()
+                    .search_sorted(&needle, SearchSortedSide::Left);
+            });
+        }
+        indices
+            .as_primitive_typed()
+            .search_sorted(&PValue::U64(needle as u64), SearchSortedSide::Left)
+    }
+
+    /// Constant time searches for `index` in the indices array.
+    ///
+    /// First determines which chunk the target index falls into, then performs
+    /// a binary search within that chunk's range.
+    ///
+    /// Returns a [`SearchResult`] indicating either the exact patch index if found,
+    /// or the insertion point if not found.
+    ///
+    /// # Panics
+    /// Panics if `chunk_offsets` or `offset_within_chunk` are not set.
+    fn search_index_chunked(&self, index: usize) -> SearchResult {
+        let Some(chunk_offsets) = &self.chunk_offsets else {
+            vortex_panic!("chunk_offsets is required to be set")
+        };
+
+        let Some(offset_within_chunk) = self.offset_within_chunk else {
+            vortex_panic!("offset_within_chunk is required to be set")
+        };
+
+        if index >= self.array_len() {
+            return SearchResult::NotFound(self.indices().len());
+        }
+
+        let chunk_idx = (index + self.offset % PATCH_CHUNK_SIZE) / PATCH_CHUNK_SIZE;
+
+        // Patch index offsets are absolute and need to be offset by the first chunk of the current slice.
+        let base_offset = self.chunk_offset_at(0);
+
+        let patches_start_idx = (self.chunk_offset_at(chunk_idx) - base_offset)
+            // Chunk offsets are only sliced off in case the slice is fully
+            // outside of the chunk range.
+            //
+            // Though the range for indices and values is sliced in terms of
+            // individual elements, not chunks. To account for that we do a
+            // saturating sub when adjusting the indices based on the chunk offset.
+            .saturating_sub(offset_within_chunk);
+
+        let patches_end_idx = if chunk_idx < chunk_offsets.len() - 1 {
+            self.chunk_offset_at(chunk_idx + 1) - base_offset - offset_within_chunk
+        } else {
+            self.indices.len()
+        };
+
+        let chunk_indices = self.indices.slice(patches_start_idx..patches_end_idx);
+        let result = Self::search_index_binary_search(&chunk_indices, index + self.offset);
+
+        match result {
+            SearchResult::Found(idx) => SearchResult::Found(patches_start_idx + idx),
+            SearchResult::NotFound(idx) => SearchResult::NotFound(patches_start_idx + idx),
+        }
+    }
+
+    /// Batch version of `search_index`.
+    ///
+    /// In contrast to `search_index`, this function requires `indices` as
+    /// well as `chunk_offsets` to be passed as slices. This is to avoid
+    /// redundant canonicalization and `scalar_at` lookups across calls.
+    fn search_index_chunked_batch<T, O>(
+        &self,
+        indices: &[T],
+        chunk_offsets: &[O],
+        index: T,
+    ) -> SearchResult
+    where
+        T: UnsignedPType,
+        O: UnsignedPType,
+        usize: TryFrom<T>,
+        usize: TryFrom<O>,
+    {
+        let Some(offset_within_chunk) = self.offset_within_chunk else {
+            vortex_panic!("offset_within_chunk is required to be set")
+        };
+
+        let chunk_idx = {
+            let Ok(index) = usize::try_from(index) else {
+                // If the needle cannot be converted to usize, it's larger than all values in this array.
+                return SearchResult::NotFound(indices.len());
+            };
+
+            if index >= self.array_len() {
+                return SearchResult::NotFound(self.indices().len());
+            }
+
+            (index + self.offset % PATCH_CHUNK_SIZE) / PATCH_CHUNK_SIZE
+        };
+
+        // Patch index offsets are absolute and need to be offset by the first chunk of the current slice.
+        let Ok(chunk_offset) = usize::try_from(chunk_offsets[chunk_idx] - chunk_offsets[0]) else {
+            vortex_panic!("chunk_offset failed to convert to usize")
+        };
+
+        let patches_start_idx = chunk_offset
+            // Chunk offsets are only sliced off in case the slice is fully
+            // outside of the chunk range.
+            //
+            // Though the range for indices and values is sliced in terms of
+            // individual elements, not chunks. To account for that we do a
+            // saturating sub when adjusting the indices based on the chunk offset.
+            .saturating_sub(offset_within_chunk);
+
+        let patches_end_idx = if chunk_idx < chunk_offsets.len() - 1 {
+            let base_offset_end = chunk_offsets[chunk_idx + 1];
+
+            let Some(offset_within_chunk) = O::from(offset_within_chunk) else {
+                vortex_panic!("offset_within_chunk failed to convert to O");
+            };
+
+            let Ok(patches_end_idx) =
+                usize::try_from(base_offset_end - chunk_offsets[0] - offset_within_chunk)
+            else {
+                vortex_panic!("patches_end_idx failed to convert to usize")
+            };
+
+            patches_end_idx
+        } else {
+            self.indices.len()
+        };
+
+        let Some(offset) = T::from(self.offset) else {
+            // If the offset cannot be converted to T, it's larger than all values in this array.
+            return SearchResult::NotFound(indices.len());
+        };
+
+        let chunk_indices = &indices[patches_start_idx..patches_end_idx];
+        let result = chunk_indices.search_sorted(&(index + offset), SearchSortedSide::Left);
+
+        match result {
+            SearchResult::Found(idx) => SearchResult::Found(patches_start_idx + idx),
+            SearchResult::NotFound(idx) => SearchResult::NotFound(patches_start_idx + idx),
+        }
+    }
+
+    /// Returns the minimum patch index
+    pub fn min_index(&self) -> usize {
+        let first = self
+            .indices
+            .scalar_at(0)
+            .as_primitive()
+            .as_::<usize>()
+            .vortex_expect("non-null");
+        first - self.offset
+    }
+
+    /// Returns the maximum patch index
+    pub fn max_index(&self) -> usize {
+        let last = self
+            .indices
+            .scalar_at(self.indices.len() - 1)
+            .as_primitive()
+            .as_::<usize>()
+            .vortex_expect("non-null");
+        last - self.offset
+    }
+
+    /// Filter the patches by a mask, resulting in new patches for the filtered array.
+    pub fn filter(&self, mask: &Mask) -> VortexResult<Option<Self>> {
+        if mask.len() != self.array_len {
+            vortex_bail!(
+                "Filter mask length {} does not match array length {}",
+                mask.len(),
+                self.array_len
+            );
+        }
+
+        match mask.indices() {
+            AllOr::All => Ok(Some(self.clone())),
+            AllOr::None => Ok(None),
+            AllOr::Some(mask_indices) => {
+                let flat_indices = self.indices().to_primitive();
+                match_each_unsigned_integer_ptype!(flat_indices.ptype(), |I| {
+                    filter_patches_with_mask(
+                        flat_indices.as_slice::<I>(),
+                        self.offset(),
+                        self.values(),
+                        mask_indices,
+                    )
+                })
+            }
+        }
+    }
+
+    /// Mask the patches, REMOVING the patches where the mask is true.
+    /// Unlike filter, this preserves the patch indices.
+    /// Unlike mask on a single array, this does not set masked values to null.
+    pub fn mask(&self, mask: &Mask) -> VortexResult<Option<Self>> {
+        if mask.len() != self.array_len {
+            vortex_bail!(
+                "Filter mask length {} does not match array length {}",
+                mask.len(),
+                self.array_len
+            );
+        }
+
+        let filter_mask = match mask.bit_buffer() {
+            AllOr::All => return Ok(None),
+            AllOr::None => return Ok(Some(self.clone())),
+            AllOr::Some(masked) => {
+                let patch_indices = self.indices().to_primitive();
+                match_each_unsigned_integer_ptype!(patch_indices.ptype(), |P| {
+                    let patch_indices = patch_indices.as_slice::<P>();
+                    Mask::from_buffer(BitBuffer::collect_bool(patch_indices.len(), |i| {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let idx = (patch_indices[i] as usize) - self.offset;
+                        !masked.value(idx)
+                    }))
+                })
+            }
+        };
+
+        if filter_mask.all_false() {
+            return Ok(None);
+        }
+
+        // SAFETY: filtering indices/values with same mask maintains their 1:1 relationship
+        let filtered_indices = filter(&self.indices, &filter_mask)?;
+        let filtered_values = filter(&self.values, &filter_mask)?;
+
+        Ok(Some(Self {
+            array_len: self.array_len,
+            offset: self.offset,
+            indices: filtered_indices,
+            values: filtered_values,
+            // TODO(0ax1): Chunk offsets are invalid after a filter is applied.
+            chunk_offsets: None,
+            offset_within_chunk: self.offset_within_chunk,
+        }))
+    }
+
+    /// Slice the patches by a range of the patched array.
+    pub fn slice(&self, range: Range<usize>) -> Option<Self> {
+        let slice_start_idx = self.search_index(range.start).to_index();
+        let slice_end_idx = self.search_index(range.end).to_index();
+
+        if slice_start_idx == slice_end_idx {
+            return None;
+        }
+
+        let values = self.values().slice(slice_start_idx..slice_end_idx);
+        let indices = self.indices().slice(slice_start_idx..slice_end_idx);
+
+        let chunk_offsets = self.chunk_offsets.as_ref().map(|chunk_offsets| {
+            let chunk_relative_offset = self.offset % PATCH_CHUNK_SIZE;
+            let chunk_start_idx = (chunk_relative_offset + range.start) / PATCH_CHUNK_SIZE;
+            let chunk_end_idx = (chunk_relative_offset + range.end).div_ceil(PATCH_CHUNK_SIZE);
+            chunk_offsets.slice(chunk_start_idx..chunk_end_idx)
+        });
+
+        let offset_within_chunk = chunk_offsets.as_ref().map(|chunk_offsets| {
+            let base_offset = chunk_offsets
+                .scalar_at(0)
+                .as_primitive()
+                .as_::<usize>()
+                .vortex_expect("chunk offset must be usize");
+            slice_start_idx - base_offset
+        });
+
+        Some(Self {
+            array_len: range.len(),
+            offset: range.start + self.offset(),
+            indices,
+            values,
+            chunk_offsets,
+            offset_within_chunk,
+        })
+    }
+
+    // https://docs.google.com/spreadsheets/d/1D9vBZ1QJ6mwcIvV5wIL0hjGgVchcEnAyhvitqWu2ugU
+    const PREFER_MAP_WHEN_PATCHES_OVER_INDICES_LESS_THAN: f64 = 5.0;
+
+    fn is_map_faster_than_search(&self, take_indices: &PrimitiveArray) -> bool {
+        (self.num_patches() as f64 / take_indices.len() as f64)
+            < Self::PREFER_MAP_WHEN_PATCHES_OVER_INDICES_LESS_THAN
+    }
+
+    /// Take the indices from the patches
+    ///
+    /// Any nulls in take_indices are added to the resulting patches.
+    pub fn take_with_nulls(&self, take_indices: &dyn Array) -> VortexResult<Option<Self>> {
+        if take_indices.is_empty() {
+            return Ok(None);
+        }
+
+        let take_indices = take_indices.to_primitive();
+        if self.is_map_faster_than_search(&take_indices) {
+            self.take_map(take_indices, true)
+        } else {
+            self.take_search(take_indices, true)
+        }
+    }
+
+    /// Take the indices from the patches.
+    ///
+    /// Any nulls in take_indices are ignored.
+    pub fn take(&self, take_indices: &dyn Array) -> VortexResult<Option<Self>> {
+        if take_indices.is_empty() {
+            return Ok(None);
+        }
+
+        let take_indices = take_indices.to_primitive();
+        if self.is_map_faster_than_search(&take_indices) {
+            self.take_map(take_indices, false)
+        } else {
+            self.take_search(take_indices, false)
+        }
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    pub fn take_search(
+        &self,
+        take_indices: PrimitiveArray,
+        include_nulls: bool,
+    ) -> VortexResult<Option<Self>> {
+        let take_indices_validity = take_indices.validity();
+        let patch_indices = self.indices.to_primitive();
+        let chunk_offsets = self.chunk_offsets().as_ref().map(|co| co.to_primitive());
+
+        let (values_indices, new_indices): (BufferMut<u64>, BufferMut<u64>) =
+            match_each_unsigned_integer_ptype!(patch_indices.ptype(), |PatchT| {
+                let patch_indices_slice = patch_indices.as_slice::<PatchT>();
+                match_each_integer_ptype!(take_indices.ptype(), |TakeT| {
+                    let take_slice = take_indices.as_slice::<TakeT>();
+
+                    if let Some(chunk_offsets) = chunk_offsets {
+                        match_each_unsigned_integer_ptype!(chunk_offsets.ptype(), |OffsetT| {
+                            let chunk_offsets = chunk_offsets.as_slice::<OffsetT>();
+                            take_indices_with_search_fn(
+                                patch_indices_slice,
+                                take_slice,
+                                take_indices.validity_mask(),
+                                include_nulls,
+                                |take_idx| {
+                                    self.search_index_chunked_batch(
+                                        patch_indices_slice,
+                                        chunk_offsets,
+                                        take_idx,
+                                    )
+                                },
+                            )
+                        })
+                    } else {
+                        take_indices_with_search_fn(
+                            patch_indices_slice,
+                            take_slice,
+                            take_indices.validity_mask(),
+                            include_nulls,
+                            |take_idx| {
+                                let Some(offset) = <PatchT as NumCast>::from(self.offset) else {
+                                    // If the offset cannot be converted to T, it's larger than all values in this array.
+                                    return SearchResult::NotFound(patch_indices_slice.len());
+                                };
+
+                                patch_indices_slice
+                                    .search_sorted(&(take_idx + offset), SearchSortedSide::Left)
+                            },
+                        )
+                    }
+                })
+            });
+
+        if new_indices.is_empty() {
+            return Ok(None);
+        }
+
+        let new_indices = new_indices.into_array();
+        let new_array_len = take_indices.len();
+        let values_validity = take_indices_validity.take(&new_indices)?;
+
+        Ok(Some(Self {
+            array_len: new_array_len,
+            offset: 0,
+            indices: new_indices.clone(),
+            values: take(
+                self.values(),
+                &PrimitiveArray::new(values_indices, values_validity).into_array(),
+            )?,
+            chunk_offsets: None,
+            offset_within_chunk: Some(0), // Reset when creating new Patches.
+        }))
+    }
+
+    pub fn take_map(
+        &self,
+        take_indices: PrimitiveArray,
+        include_nulls: bool,
+    ) -> VortexResult<Option<Self>> {
+        let indices = self.indices.to_primitive();
+        let new_length = take_indices.len();
+
+        let Some((new_sparse_indices, value_indices)) =
+            match_each_unsigned_integer_ptype!(indices.ptype(), |Indices| {
+                match_each_integer_ptype!(take_indices.ptype(), |TakeIndices| {
+                    take_map::<_, TakeIndices>(
+                        indices.as_slice::<Indices>(),
+                        take_indices,
+                        self.offset(),
+                        self.min_index(),
+                        self.max_index(),
+                        include_nulls,
+                    )?
+                })
+            })
+        else {
+            return Ok(None);
+        };
+
+        let taken_values = take(self.values(), &value_indices)?;
+
+        Ok(Some(Patches {
+            array_len: new_length,
+            offset: 0,
+            indices: new_sparse_indices,
+            values: taken_values,
+            // TODO(0ax1): Chunk offsets are invalid after take is applied.
+            chunk_offsets: None,
+            offset_within_chunk: self.offset_within_chunk,
+        }))
+    }
+
+    pub fn map_values<F>(self, f: F) -> VortexResult<Self>
+    where
+        F: FnOnce(ArrayRef) -> VortexResult<ArrayRef>,
+    {
+        let values = f(self.values)?;
+        if self.indices.len() != values.len() {
+            vortex_bail!(
+                "map_values must preserve length: expected {} received {}",
+                self.indices.len(),
+                values.len()
+            )
+        }
+
+        Ok(Self {
+            array_len: self.array_len,
+            offset: self.offset,
+            indices: self.indices,
+            values,
+            chunk_offsets: self.chunk_offsets,
+            offset_within_chunk: self.offset_within_chunk,
+        })
+    }
+}
+
+fn take_map<I: NativePType + Hash + Eq + TryFrom<usize>, T: NativePType>(
+    indices: &[I],
+    take_indices: PrimitiveArray,
+    indices_offset: usize,
+    min_index: usize,
+    max_index: usize,
+    include_nulls: bool,
+) -> VortexResult<Option<(ArrayRef, ArrayRef)>>
+where
+    usize: TryFrom<T>,
+    VortexError: From<<I as TryFrom<usize>>::Error>,
+{
+    let take_indices_validity = take_indices.validity();
+    let take_indices = take_indices.as_slice::<T>();
+    let offset_i = I::try_from(indices_offset)?;
+
+    let sparse_index_to_value_index: HashMap<I, usize> = indices
+        .iter()
+        .copied()
+        .map(|idx| idx - offset_i)
+        .enumerate()
+        .map(|(value_index, sparse_index)| (sparse_index, value_index))
+        .collect();
+
+    let (new_sparse_indices, value_indices): (BufferMut<u64>, BufferMut<u64>) = take_indices
+        .iter()
+        .copied()
+        .map(usize::try_from)
+        .process_results(|iter| {
+            iter.enumerate()
+                .filter_map(|(idx_in_take, ti)| {
+                    // If we have to take nulls the take index doesn't matter, make it 0 for consistency
+                    if include_nulls && take_indices_validity.is_null(idx_in_take) {
+                        Some((idx_in_take as u64, 0))
+                    } else if ti < min_index || ti > max_index {
+                        None
+                    } else {
+                        sparse_index_to_value_index
+                            .get(
+                                &I::try_from(ti)
+                                    .vortex_expect("take index is between min and max index"),
+                            )
+                            .map(|value_index| (idx_in_take as u64, *value_index as u64))
+                    }
+                })
+                .unzip()
+        })
+        .map_err(|_| vortex_err!("Failed to convert index to usize"))?;
+
+    if new_sparse_indices.is_empty() {
+        return Ok(None);
+    }
+
+    let new_sparse_indices = new_sparse_indices.into_array();
+    let values_validity = take_indices_validity.take(&new_sparse_indices)?;
+    Ok(Some((
+        new_sparse_indices,
+        PrimitiveArray::new(value_indices, values_validity).into_array(),
+    )))
+}
+
+/// Filter patches with the provided mask (in flattened space).
+///
+/// The filter mask may contain indices that are non-patched. The return value of this function
+/// is a new set of `Patches` with the indices relative to the provided `mask` rank, and the
+/// patch values.
+fn filter_patches_with_mask<T: IntegerPType>(
+    patch_indices: &[T],
+    offset: usize,
+    patch_values: &dyn Array,
+    mask_indices: &[usize],
+) -> VortexResult<Option<Patches>> {
+    let true_count = mask_indices.len();
+    let mut new_patch_indices = BufferMut::<u64>::with_capacity(true_count);
+    let mut new_mask_indices = Vec::with_capacity(true_count);
+
+    // Attempt to move the window by `STRIDE` elements on each iteration. This assumes that
+    // the patches are relatively sparse compared to the overall mask, and so many indices in the
+    // mask will end up being skipped.
+    const STRIDE: usize = 4;
+
+    let mut mask_idx = 0usize;
+    let mut true_idx = 0usize;
+
+    while mask_idx < patch_indices.len() && true_idx < true_count {
+        // NOTE: we are searching for overlaps between sorted, unaligned indices in `patch_indices`
+        //  and `mask_indices`. We assume that Patches are sparse relative to the global space of
+        //  the mask (which covers both patch and non-patch values of the parent array), and so to
+        //  quickly jump through regions with no overlap, we attempt to move our pointers by STRIDE
+        //  elements on each iteration. If we cannot rule out overlap due to min/max values, we
+        //  fallback to performing a two-way iterator merge.
+        if (mask_idx + STRIDE) < patch_indices.len() && (true_idx + STRIDE) < mask_indices.len() {
+            // Load a vector of each into our registers.
+            let left_min = patch_indices[mask_idx].to_usize().vortex_expect("left_min") - offset;
+            let left_max = patch_indices[mask_idx + STRIDE]
+                .to_usize()
+                .vortex_expect("left_max")
+                - offset;
+            let right_min = mask_indices[true_idx];
+            let right_max = mask_indices[true_idx + STRIDE];
+
+            if left_min > right_max {
+                // Advance right side
+                true_idx += STRIDE;
+                continue;
+            } else if right_min > left_max {
+                mask_idx += STRIDE;
+                continue;
+            } else {
+                // Fallthrough to direct comparison path.
+            }
+        }
+
+        // Two-way sorted iterator merge:
+
+        let left = patch_indices[mask_idx].to_usize().vortex_expect("left") - offset;
+        let right = mask_indices[true_idx];
+
+        match left.cmp(&right) {
+            Ordering::Less => {
+                mask_idx += 1;
+            }
+            Ordering::Greater => {
+                true_idx += 1;
+            }
+            Ordering::Equal => {
+                // Save the mask index as well as the positional index.
+                new_mask_indices.push(mask_idx);
+                new_patch_indices.push(true_idx as u64);
+
+                mask_idx += 1;
+                true_idx += 1;
+            }
+        }
+    }
+
+    if new_mask_indices.is_empty() {
+        return Ok(None);
+    }
+
+    let new_patch_indices = new_patch_indices.into_array();
+    let new_patch_values = filter(
+        patch_values,
+        &Mask::from_indices(patch_values.len(), new_mask_indices),
+    )?;
+
+    Ok(Some(Patches::new(
+        true_count,
+        0,
+        new_patch_indices,
+        new_patch_values,
+        // TODO(0ax1): Chunk offsets are invalid after a filter is applied.
+        None,
+    )))
+}
+
+fn take_indices_with_search_fn<I: UnsignedPType, T: IntegerPType, F: Fn(I) -> SearchResult>(
+    indices: &[I],
+    take_indices: &[T],
+    take_validity: Mask,
+    include_nulls: bool,
+    search_fn: F,
+) -> (BufferMut<u64>, BufferMut<u64>) {
+    take_indices
+        .iter()
+        .enumerate()
+        .filter_map(|(new_patch_idx, &take_idx)| {
+            if include_nulls && !take_validity.value(new_patch_idx) {
+                // For nulls, patch index doesn't matter - use 0 for consistency
+                Some((0u64, new_patch_idx as u64))
+            } else {
+                let search_result = I::from(take_idx)
+                    .map(&search_fn)
+                    .unwrap_or(SearchResult::NotFound(indices.len()));
+
+                search_result
+                    .to_found()
+                    .map(|patch_idx| (patch_idx as u64, new_patch_idx as u64))
+            }
+        })
+        .unzip()
+}
+
+#[cfg(test)]
+mod test {
+    use vortex_buffer::{BufferMut, buffer};
+    use vortex_mask::Mask;
+
+    use crate::arrays::PrimitiveArray;
+    use crate::patches::Patches;
+    use crate::search_sorted::SearchResult;
+    use crate::validity::Validity;
+    use crate::{IntoArray, ToCanonical};
+
+    #[test]
+    fn test_filter() {
+        let patches = Patches::new(
+            100,
+            0,
+            buffer![10u32, 11, 20].into_array(),
+            buffer![100, 110, 200].into_array(),
+            None,
+        );
+
+        let filtered = patches
+            .filter(&Mask::from_indices(100, vec![10, 20, 30]))
+            .unwrap()
+            .unwrap();
+
+        let indices = filtered.indices().to_primitive();
+        let values = filtered.values().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[0, 1]);
+        assert_eq!(values.as_slice::<i32>(), &[100, 200]);
+    }
+
+    #[test]
+    fn take_with_nulls() {
+        let patches = Patches::new(
+            20,
+            0,
+            buffer![2u64, 9, 15].into_array(),
+            PrimitiveArray::new(buffer![33_i32, 44, 55], Validity::AllValid).into_array(),
+            None,
+        );
+
+        let taken = patches
+            .take(
+                &PrimitiveArray::new(buffer![9, 0], Validity::from_iter(vec![true, false]))
+                    .into_array(),
+            )
+            .unwrap()
+            .unwrap();
+        let primitive_values = taken.values().to_primitive();
+        let primitive_indices = taken.indices().to_primitive();
+        assert_eq!(taken.array_len(), 2);
+        assert_eq!(primitive_values.as_slice::<i32>(), [44]);
+        assert_eq!(primitive_indices.as_slice::<u64>(), [0]);
+        assert_eq!(
+            primitive_values.validity_mask(),
+            Mask::from_iter(vec![true])
+        );
+    }
+
+    #[test]
+    fn take_search_with_nulls_chunked() {
+        let patches = Patches::new(
+            20,
+            0,
+            buffer![2u64, 9, 15].into_array(),
+            buffer![33_i32, 44, 55].into_array(),
+            Some(buffer![0u64].into_array()),
+        );
+
+        let taken = patches
+            .take_search(
+                PrimitiveArray::new(buffer![9, 0], Validity::from_iter([true, false])),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+
+        let primitive_values = taken.values().to_primitive();
+        let primitive_indices = taken.indices().to_primitive();
+        assert_eq!(taken.array_len(), 2);
+        assert_eq!(primitive_values.as_slice::<i32>(), [44, 33]);
+        assert_eq!(primitive_indices.as_slice::<u64>(), [0, 1]);
+
+        assert_eq!(
+            primitive_values.validity_mask(),
+            Mask::from_iter([true, false])
+        );
+    }
+
+    #[test]
+    fn take_search_chunked_multiple_chunks() {
+        let patches = Patches::new(
+            2048,
+            0,
+            buffer![100u64, 500, 1200, 1800].into_array(),
+            buffer![10_i32, 20, 30, 40].into_array(),
+            Some(buffer![0u64, 2].into_array()),
+        );
+
+        let taken = patches
+            .take_search(
+                PrimitiveArray::new(buffer![500, 1200, 999], Validity::AllValid),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+
+        let primitive_values = taken.values().to_primitive();
+        assert_eq!(taken.array_len(), 3);
+        assert_eq!(primitive_values.as_slice::<i32>(), [20, 30]);
+    }
+
+    #[test]
+    fn take_search_chunked_indices_with_no_patches() {
+        let patches = Patches::new(
+            20,
+            0,
+            buffer![2u64, 9, 15].into_array(),
+            buffer![33_i32, 44, 55].into_array(),
+            Some(buffer![0u64].into_array()),
+        );
+
+        let taken = patches
+            .take_search(
+                PrimitiveArray::new(buffer![3, 4, 5], Validity::AllValid),
+                true,
+            )
+            .unwrap();
+
+        assert!(taken.is_none());
+    }
+
+    #[test]
+    fn take_search_chunked_interleaved() {
+        let patches = Patches::new(
+            30,
+            0,
+            buffer![5u64, 10, 20, 25].into_array(),
+            buffer![100_i32, 200, 300, 400].into_array(),
+            Some(buffer![0u64].into_array()),
+        );
+
+        let taken = patches
+            .take_search(
+                PrimitiveArray::new(buffer![10, 15, 20, 99], Validity::AllValid),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+
+        let primitive_values = taken.values().to_primitive();
+        assert_eq!(taken.array_len(), 4);
+        assert_eq!(primitive_values.as_slice::<i32>(), [200, 300]);
+    }
+
+    #[test]
+    fn test_take_search_multiple_chunk_offsets() {
+        let patches = Patches::new(
+            1500,
+            0,
+            BufferMut::from_iter(0..1500u64).into_array(),
+            BufferMut::from_iter(0..1500i32).into_array(),
+            Some(buffer![0u64, 1024u64].into_array()),
+        );
+
+        let taken = patches
+            .take_search(
+                PrimitiveArray::new(BufferMut::from_iter(0..1500u64), Validity::AllValid),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(taken.array_len(), 1500);
+    }
+
+    #[test]
+    fn test_slice() {
+        let values = buffer![15_u32, 135, 13531, 42].into_array();
+        let indices = buffer![10_u64, 11, 50, 100].into_array();
+
+        let patches = Patches::new(101, 0, indices, values, None);
+
+        let sliced = patches.slice(15..100).unwrap();
+        assert_eq!(sliced.array_len(), 100 - 15);
+        let primitive = sliced.values().to_primitive();
+
+        assert_eq!(primitive.as_slice::<u32>(), &[13531]);
+    }
+
+    #[test]
+    fn doubly_sliced() {
+        let values = buffer![15_u32, 135, 13531, 42].into_array();
+        let indices = buffer![10_u64, 11, 50, 100].into_array();
+
+        let patches = Patches::new(101, 0, indices, values, None);
+
+        let sliced = patches.slice(15..100).unwrap();
+        assert_eq!(sliced.array_len(), 100 - 15);
+        let primitive = sliced.values().to_primitive();
+
+        assert_eq!(primitive.as_slice::<u32>(), &[13531]);
+
+        let doubly_sliced = sliced.slice(35..36).unwrap();
+        let primitive_doubly_sliced = doubly_sliced.values().to_primitive();
+
+        assert_eq!(primitive_doubly_sliced.as_slice::<u32>(), &[13531]);
+    }
+
+    #[test]
+    fn test_mask_all_true() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        let mask = Mask::new_true(10);
+        let masked = patches.mask(&mask).unwrap();
+        assert!(masked.is_none());
+    }
+
+    #[test]
+    fn test_mask_all_false() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        let mask = Mask::new_false(10);
+        let masked = patches.mask(&mask).unwrap().unwrap();
+
+        // No patch values should be masked
+        let masked_values = masked.values().to_primitive();
+        assert_eq!(masked_values.as_slice::<i32>(), &[100, 200, 300]);
+        assert!(masked_values.is_valid(0));
+        assert!(masked_values.is_valid(1));
+        assert!(masked_values.is_valid(2));
+
+        // Indices should remain unchanged
+        let indices = masked.indices().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[2, 5, 8]);
+    }
+
+    #[test]
+    fn test_mask_partial() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        // Mask that removes patches at indices 2 and 8 (but not 5)
+        let mask = Mask::from_iter([
+            false, false, true, false, false, false, false, false, true, false,
+        ]);
+        let masked = patches.mask(&mask).unwrap().unwrap();
+
+        // Only the patch at index 5 should remain
+        let masked_values = masked.values().to_primitive();
+        assert_eq!(masked_values.len(), 1);
+        assert_eq!(masked_values.as_slice::<i32>(), &[200]);
+
+        // Only index 5 should remain
+        let indices = masked.indices().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[5]);
+    }
+
+    #[test]
+    fn test_mask_with_offset() {
+        let patches = Patches::new(
+            10,
+            5,                                  // offset
+            buffer![7u64, 10, 13].into_array(), // actual indices are 2, 5, 8
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        // Mask that sets actual index 2 to null
+        let mask = Mask::from_iter([
+            false, false, true, false, false, false, false, false, false, false,
+        ]);
+
+        let masked = patches.mask(&mask).unwrap().unwrap();
+        assert_eq!(masked.array_len(), 10);
+        assert_eq!(masked.offset(), 5);
+        let indices = masked.indices().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[10, 13]);
+        let masked_values = masked.values().to_primitive();
+        assert_eq!(masked_values.as_slice::<i32>(), &[200, 300]);
+    }
+
+    #[test]
+    fn test_mask_nullable_values() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            PrimitiveArray::from_option_iter([Some(100i32), None, Some(300)]).into_array(),
+            None,
+        );
+
+        // Test masking removes patch at index 2
+        let mask = Mask::from_iter([
+            false, false, true, false, false, false, false, false, false, false,
+        ]);
+        let masked = patches.mask(&mask).unwrap().unwrap();
+
+        // Patches at indices 5 and 8 should remain
+        let indices = masked.indices().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[5, 8]);
+
+        // Values should be the null and 300
+        let masked_values = masked.values().to_primitive();
+        assert_eq!(masked_values.len(), 2);
+        assert!(!masked_values.is_valid(0)); // the null value at index 5
+        assert!(masked_values.is_valid(1)); // the 300 value at index 8
+        assert_eq!(i32::try_from(&masked_values.scalar_at(1)).unwrap(), 300i32);
+    }
+
+    #[test]
+    fn test_filter_keep_all() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        // Keep all indices (mask with indices 0-9)
+        let mask = Mask::from_indices(10, (0..10).collect());
+        let filtered = patches.filter(&mask).unwrap().unwrap();
+
+        let indices = filtered.indices().to_primitive();
+        let values = filtered.values().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[2, 5, 8]);
+        assert_eq!(values.as_slice::<i32>(), &[100, 200, 300]);
+    }
+
+    #[test]
+    fn test_filter_none() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        // Filter out all (empty mask means keep nothing)
+        let mask = Mask::from_indices(10, vec![]);
+        let filtered = patches.filter(&mask).unwrap();
+        assert!(filtered.is_none());
+    }
+
+    #[test]
+    fn test_filter_with_indices() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        // Keep indices 2, 5, 9 (so patches at 2 and 5 remain)
+        let mask = Mask::from_indices(10, vec![2, 5, 9]);
+        let filtered = patches.filter(&mask).unwrap().unwrap();
+
+        let indices = filtered.indices().to_primitive();
+        let values = filtered.values().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[0, 1]); // Adjusted indices
+        assert_eq!(values.as_slice::<i32>(), &[100, 200]);
+    }
+
+    #[test]
+    fn test_slice_full_range() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        let sliced = patches.slice(0..10).unwrap();
+
+        let indices = sliced.indices().to_primitive();
+        let values = sliced.values().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[2, 5, 8]);
+        assert_eq!(values.as_slice::<i32>(), &[100, 200, 300]);
+    }
+
+    #[test]
+    fn test_slice_partial() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        // Slice from 3 to 8 (includes patch at 5)
+        let sliced = patches.slice(3..8).unwrap();
+
+        let indices = sliced.indices().to_primitive();
+        let values = sliced.values().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[5]); // Index stays the same
+        assert_eq!(values.as_slice::<i32>(), &[200]);
+        assert_eq!(sliced.array_len(), 5); // 8 - 3 = 5
+        assert_eq!(sliced.offset(), 3); // New offset
+    }
+
+    #[test]
+    fn test_slice_no_patches() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        // Slice from 6 to 7 (no patches in this range)
+        let sliced = patches.slice(6..7);
+        assert!(sliced.is_none());
+    }
+
+    #[test]
+    fn test_slice_with_offset() {
+        let patches = Patches::new(
+            10,
+            5,                                  // offset
+            buffer![7u64, 10, 13].into_array(), // actual indices are 2, 5, 8
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        // Slice from 3 to 8 (includes patch at actual index 5)
+        let sliced = patches.slice(3..8).unwrap();
+
+        let indices = sliced.indices().to_primitive();
+        let values = sliced.values().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[10]); // Index stays the same (offset + 5 = 10)
+        assert_eq!(values.as_slice::<i32>(), &[200]);
+        assert_eq!(sliced.offset(), 8); // New offset = 5 + 3
+    }
+
+    #[test]
+    fn test_patch_values() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        let values = patches.values().to_primitive();
+        assert_eq!(i32::try_from(&values.scalar_at(0)).unwrap(), 100i32);
+        assert_eq!(i32::try_from(&values.scalar_at(1)).unwrap(), 200i32);
+        assert_eq!(i32::try_from(&values.scalar_at(2)).unwrap(), 300i32);
+    }
+
+    #[test]
+    fn test_indices_range() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        assert_eq!(patches.min_index(), 2);
+        assert_eq!(patches.max_index(), 8);
+    }
+
+    #[test]
+    fn test_search_index() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        // Search for exact indices
+        assert_eq!(patches.search_index(2), SearchResult::Found(0));
+        assert_eq!(patches.search_index(5), SearchResult::Found(1));
+        assert_eq!(patches.search_index(8), SearchResult::Found(2));
+
+        // Search for non-patch indices
+        assert_eq!(patches.search_index(0), SearchResult::NotFound(0));
+        assert_eq!(patches.search_index(3), SearchResult::NotFound(1));
+        assert_eq!(patches.search_index(6), SearchResult::NotFound(2));
+        assert_eq!(patches.search_index(9), SearchResult::NotFound(3));
+    }
+
+    #[test]
+    fn test_mask_boundary_patches() {
+        // Test masking patches at array boundaries
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![0u64, 9].into_array(),
+            buffer![100i32, 200].into_array(),
+            None,
+        );
+
+        let mask = Mask::from_iter([
+            true, false, false, false, false, false, false, false, false, false,
+        ]);
+        let masked = patches.mask(&mask).unwrap();
+        assert!(masked.is_some());
+        let masked = masked.unwrap();
+        let indices = masked.indices().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[9]);
+        let values = masked.values().to_primitive();
+        assert_eq!(values.as_slice::<i32>(), &[200]);
+    }
+
+    #[test]
+    fn test_mask_all_patches_removed() {
+        // Test when all patches are masked out
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        // Mask that removes all patches
+        let mask = Mask::from_iter([
+            false, false, true, false, false, true, false, false, true, false,
+        ]);
+        let masked = patches.mask(&mask).unwrap();
+        assert!(masked.is_none());
+    }
+
+    #[test]
+    fn test_mask_no_patches_removed() {
+        // Test when no patches are masked
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        // Mask that doesn't affect any patches
+        let mask = Mask::from_iter([
+            true, false, false, true, false, false, true, false, false, true,
+        ]);
+        let masked = patches.mask(&mask).unwrap().unwrap();
+
+        let indices = masked.indices().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[2, 5, 8]);
+        let values = masked.values().to_primitive();
+        assert_eq!(values.as_slice::<i32>(), &[100, 200, 300]);
+    }
+
+    #[test]
+    fn test_mask_single_patch() {
+        // Test with a single patch
+        let patches = Patches::new(
+            5,
+            0,
+            buffer![2u64].into_array(),
+            buffer![42i32].into_array(),
+            None,
+        );
+
+        // Mask that removes the single patch
+        let mask = Mask::from_iter([false, false, true, false, false]);
+        let masked = patches.mask(&mask).unwrap();
+        assert!(masked.is_none());
+
+        // Mask that keeps the single patch
+        let mask = Mask::from_iter([true, false, false, true, false]);
+        let masked = patches.mask(&mask).unwrap().unwrap();
+        let indices = masked.indices().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[2]);
+    }
+
+    #[test]
+    fn test_mask_contiguous_patches() {
+        // Test with contiguous patches
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![3u64, 4, 5, 6].into_array(),
+            buffer![100i32, 200, 300, 400].into_array(),
+            None,
+        );
+
+        // Mask that removes middle patches
+        let mask = Mask::from_iter([
+            false, false, false, false, true, true, false, false, false, false,
+        ]);
+        let masked = patches.mask(&mask).unwrap().unwrap();
+
+        let indices = masked.indices().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[3, 6]);
+        let values = masked.values().to_primitive();
+        assert_eq!(values.as_slice::<i32>(), &[100, 400]);
+    }
+
+    #[test]
+    fn test_mask_with_large_offset() {
+        // Test with a large offset that shifts all indices
+        let patches = Patches::new(
+            20,
+            15,
+            buffer![16u64, 17, 19].into_array(), // actual indices are 1, 2, 4
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        // Mask that removes the patch at actual index 2
+        let mask = Mask::from_iter([
+            false, false, true, false, false, false, false, false, false, false, false, false,
+            false, false, false, false, false, false, false, false,
+        ]);
+        let masked = patches.mask(&mask).unwrap().unwrap();
+
+        let indices = masked.indices().to_primitive();
+        assert_eq!(indices.as_slice::<u64>(), &[16, 19]);
+        let values = masked.values().to_primitive();
+        assert_eq!(values.as_slice::<i32>(), &[100, 300]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Filter mask length 5 does not match array length 10")]
+    fn test_mask_wrong_length() {
+        let patches = Patches::new(
+            10,
+            0,
+            buffer![2u64, 5, 8].into_array(),
+            buffer![100i32, 200, 300].into_array(),
+            None,
+        );
+
+        // Mask with wrong length
+        let mask = Mask::from_iter([false, false, true, false, false]);
+        patches.mask(&mask).unwrap();
+    }
+
+    #[test]
+    fn test_chunk_offsets_search() {
+        let indices = buffer![100u64, 200, 3000, 3100].into_array();
+        let values = buffer![10i32, 20, 30, 40].into_array();
+        let chunk_offsets = buffer![0u64, 2, 2, 3].into_array();
+        let patches = Patches::new(4096, 0, indices, values, Some(chunk_offsets));
+
+        assert!(patches.chunk_offsets.is_some());
+
+        // chunk 0: patches at 100, 200
+        assert_eq!(patches.search_index(100), SearchResult::Found(0));
+        assert_eq!(patches.search_index(200), SearchResult::Found(1));
+
+        // chunks 1, 2: no patches
+        assert_eq!(patches.search_index(1500), SearchResult::NotFound(2));
+        assert_eq!(patches.search_index(2000), SearchResult::NotFound(2));
+
+        // chunk 3: patches at 3000, 3100
+        assert_eq!(patches.search_index(3000), SearchResult::Found(2));
+        assert_eq!(patches.search_index(3100), SearchResult::Found(3));
+
+        assert_eq!(patches.search_index(1024), SearchResult::NotFound(2));
+    }
+
+    #[test]
+    fn test_chunk_offsets_with_slice() {
+        let indices = buffer![100u64, 500, 1200, 1300, 1500, 1800, 2100, 2500].into_array();
+        let values = buffer![10i32, 20, 30, 35, 40, 45, 50, 60].into_array();
+        let chunk_offsets = buffer![0u64, 2, 6].into_array();
+        let patches = Patches::new(3000, 0, indices, values, Some(chunk_offsets));
+
+        let sliced = patches.slice(1000..2200).unwrap();
+
+        assert!(sliced.chunk_offsets.is_some());
+        assert_eq!(sliced.offset(), 1000);
+
+        assert_eq!(sliced.search_index(200), SearchResult::Found(0));
+        assert_eq!(sliced.search_index(500), SearchResult::Found(2));
+        assert_eq!(sliced.search_index(1100), SearchResult::Found(4));
+
+        assert_eq!(sliced.search_index(250), SearchResult::NotFound(1));
+    }
+
+    #[test]
+    fn test_chunk_offsets_with_slice_after_first_chunk() {
+        let indices = buffer![100u64, 500, 1200, 1300, 1500, 1800, 2100, 2500].into_array();
+        let values = buffer![10i32, 20, 30, 35, 40, 45, 50, 60].into_array();
+        let chunk_offsets = buffer![0u64, 2, 6].into_array();
+        let patches = Patches::new(3000, 0, indices, values, Some(chunk_offsets));
+
+        let sliced = patches.slice(1300..2200).unwrap();
+
+        assert!(sliced.chunk_offsets.is_some());
+        assert_eq!(sliced.offset(), 1300);
+
+        assert_eq!(sliced.search_index(0), SearchResult::Found(0));
+        assert_eq!(sliced.search_index(200), SearchResult::Found(1));
+        assert_eq!(sliced.search_index(500), SearchResult::Found(2));
+        assert_eq!(sliced.search_index(250), SearchResult::NotFound(2));
+        assert_eq!(sliced.search_index(900), SearchResult::NotFound(4));
+    }
+
+    #[test]
+    fn test_chunk_offsets_slice_empty_result() {
+        let indices = buffer![100u64, 200, 3000, 3100].into_array();
+        let values = buffer![10i32, 20, 30, 40].into_array();
+        let chunk_offsets = buffer![0u64, 2].into_array();
+        let patches = Patches::new(4000, 0, indices, values, Some(chunk_offsets));
+
+        let sliced = patches.slice(1000..2000);
+        assert!(sliced.is_none());
+    }
+
+    #[test]
+    fn test_chunk_offsets_slice_single_patch() {
+        let indices = buffer![100u64, 1200, 1300, 2500].into_array();
+        let values = buffer![10i32, 20, 30, 40].into_array();
+        let chunk_offsets = buffer![0u64, 1, 3].into_array();
+        let patches = Patches::new(3000, 0, indices, values, Some(chunk_offsets));
+
+        let sliced = patches.slice(1100..1250).unwrap();
+
+        assert_eq!(sliced.num_patches(), 1);
+        assert_eq!(sliced.offset(), 1100);
+        assert_eq!(sliced.search_index(100), SearchResult::Found(0)); // 1200 - 1100 = 100
+        assert_eq!(sliced.search_index(50), SearchResult::NotFound(0));
+        assert_eq!(sliced.search_index(150), SearchResult::NotFound(1));
+    }
+
+    #[test]
+    fn test_chunk_offsets_slice_across_chunks() {
+        let indices = buffer![100u64, 200, 1100, 1200, 2100, 2200].into_array();
+        let values = buffer![10i32, 20, 30, 40, 50, 60].into_array();
+        let chunk_offsets = buffer![0u64, 2, 4].into_array();
+        let patches = Patches::new(3000, 0, indices, values, Some(chunk_offsets));
+
+        let sliced = patches.slice(150..2150).unwrap();
+
+        assert_eq!(sliced.num_patches(), 4);
+        assert_eq!(sliced.offset(), 150);
+
+        assert_eq!(sliced.search_index(50), SearchResult::Found(0)); // 200 - 150 = 50
+        assert_eq!(sliced.search_index(950), SearchResult::Found(1)); // 1100 - 150 = 950
+        assert_eq!(sliced.search_index(1050), SearchResult::Found(2)); // 1200 - 150 = 1050
+        assert_eq!(sliced.search_index(1950), SearchResult::Found(3)); // 2100 - 150 = 1950
+    }
+
+    #[test]
+    fn test_chunk_offsets_boundary_searches() {
+        let indices = buffer![1023u64, 1024, 1025, 2047, 2048].into_array();
+        let values = buffer![10i32, 20, 30, 40, 50].into_array();
+        let chunk_offsets = buffer![0u64, 1, 4].into_array();
+        let patches = Patches::new(3000, 0, indices, values, Some(chunk_offsets));
+
+        assert_eq!(patches.search_index(1023), SearchResult::Found(0));
+        assert_eq!(patches.search_index(1024), SearchResult::Found(1));
+        assert_eq!(patches.search_index(1025), SearchResult::Found(2));
+        assert_eq!(patches.search_index(2047), SearchResult::Found(3));
+        assert_eq!(patches.search_index(2048), SearchResult::Found(4));
+
+        assert_eq!(patches.search_index(1022), SearchResult::NotFound(0));
+        assert_eq!(patches.search_index(2046), SearchResult::NotFound(3));
+    }
+
+    #[test]
+    fn test_chunk_offsets_slice_edge_cases() {
+        let indices = buffer![0u64, 1, 1023, 1024, 2047, 2048].into_array();
+        let values = buffer![10i32, 20, 30, 40, 50, 60].into_array();
+        let chunk_offsets = buffer![0u64, 3, 5].into_array();
+        let patches = Patches::new(3000, 0, indices, values, Some(chunk_offsets));
+
+        // Slice at the very beginning
+        let sliced = patches.slice(0..10).unwrap();
+        assert_eq!(sliced.num_patches(), 2);
+        assert_eq!(sliced.search_index(0), SearchResult::Found(0));
+        assert_eq!(sliced.search_index(1), SearchResult::Found(1));
+
+        // Slice at the very end
+        let sliced = patches.slice(2040..3000).unwrap();
+        assert_eq!(sliced.num_patches(), 2); // patches at 2047 and 2048
+        assert_eq!(sliced.search_index(7), SearchResult::Found(0)); // 2047 - 2040
+        assert_eq!(sliced.search_index(8), SearchResult::Found(1)); // 2048 - 2040
+    }
+
+    #[test]
+    fn test_chunk_offsets_slice_nested() {
+        let indices = buffer![100u64, 200, 300, 400, 500, 600].into_array();
+        let values = buffer![10i32, 20, 30, 40, 50, 60].into_array();
+        let chunk_offsets = buffer![0u64].into_array();
+        let patches = Patches::new(1000, 0, indices, values, Some(chunk_offsets));
+
+        let sliced1 = patches.slice(150..550).unwrap();
+        assert_eq!(sliced1.num_patches(), 4); // 200, 300, 400, 500
+
+        let sliced2 = sliced1.slice(100..250).unwrap();
+        assert_eq!(sliced2.num_patches(), 1); // 300
+        assert_eq!(sliced2.offset(), 250);
+
+        assert_eq!(sliced2.search_index(50), SearchResult::Found(0)); // 300 - 250
+        assert_eq!(sliced2.search_index(150), SearchResult::NotFound(1));
+    }
+
+    #[test]
+    fn test_index_larger_than_length() {
+        let chunk_offsets = buffer![0u64].into_array();
+        let indices = buffer![1023u64].into_array();
+        let values = buffer![42i32].into_array();
+        let patches = Patches::new(1024, 0, indices, values, Some(chunk_offsets));
+        assert_eq!(patches.search_index(2048), SearchResult::NotFound(1));
+    }
+}

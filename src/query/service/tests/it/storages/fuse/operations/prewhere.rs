@@ -44,6 +44,7 @@ use databend_common_expression::types::NumberDataType;
 use databend_common_expression::types::NumberScalar;
 use databend_common_functions::BUILTIN_FUNCTIONS;
 use databend_common_storages_fuse::FuseBlockPartInfo;
+use databend_common_storages_fuse::FuseStorageFormat;
 use databend_common_storages_fuse::TableContext;
 use databend_common_storages_fuse::io::BlockReader;
 use databend_common_storages_fuse::io::DataItem;
@@ -289,6 +290,7 @@ async fn prepare_prewhere_data() -> Result<PrewhereTestSetup> {
         ctx.clone(),
         operator.clone(),
         schema.clone(),
+        FuseStorageFormat::Parquet,
         prewhere_info.output_columns.clone(),
         false,
         false,
@@ -313,6 +315,7 @@ async fn prepare_prewhere_data() -> Result<PrewhereTestSetup> {
         compression,
         sort_min_max: None,
         block_meta_index: None,
+        block_file_size: 0,
     };
 
     let bloom_y = create_bloom_filter_for_int32(&[30]);

@@ -1,0 +1,382 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+use arrow_array::BooleanArray;
+use vortex_buffer::{BitBuffer, BitBufferMut, ByteBuffer};
+use vortex_dtype::DType;
+use vortex_error::{VortexExpect, VortexResult, vortex_ensure};
+use vortex_mask::Mask;
+
+use crate::arrays::bool;
+use crate::stats::ArrayStats;
+use crate::validity::Validity;
+use crate::{ArrayRef, IntoArray};
+
+/// A boolean array that stores true/false values in a compact bit-packed format.
+///
+/// This mirrors the Apache Arrow Boolean array encoding, where each boolean value
+/// is stored as a single bit rather than a full byte.
+///
+/// The data layout uses:
+/// - A bit-packed buffer where each bit represents one boolean value (0 = false, 1 = true)
+/// - An optional validity child array, which must be of type `Bool(NonNullable)`, where true values
+///   indicate valid and false indicates null. if the i-th value is null in the validity child,
+///   the i-th packed bit in the buffer may be 0 or 1, i.e. it is undefined.
+/// - Bit-level slicing is supported with minimal overhead
+///
+/// # Examples
+///
+/// ```
+/// use vortex_array::arrays::BoolArray;
+/// use vortex_array::IntoArray;
+///
+/// // Create from iterator using FromIterator impl
+/// let array: BoolArray = [true, false, true, false].into_iter().collect();
+///
+/// // Slice the array
+/// let sliced = array.slice(1..3);
+/// assert_eq!(sliced.len(), 2);
+///
+/// // Access individual values
+/// let value = array.scalar_at(0);
+/// assert_eq!(value, true.into());
+/// ```
+#[derive(Clone, Debug)]
+pub struct BoolArray {
+    pub(super) dtype: DType,
+    pub(super) buffer: BitBuffer,
+    pub(super) validity: Validity,
+    pub(super) stats_set: ArrayStats,
+}
+
+impl BoolArray {
+    /// Constructs a new `BoolArray`.
+    ///
+    /// See [`BoolArray::new_unchecked`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provided components do not satisfy the invariants documented in
+    /// [`BoolArray::new_unchecked`].
+    pub fn try_new(
+        buffer: ByteBuffer,
+        offset: usize,
+        len: usize,
+        validity: Validity,
+    ) -> VortexResult<Self> {
+        Self::validate(&buffer, offset, len, &validity)?;
+
+        // SAFETY: validate ensures all invariants are met.
+        Ok(unsafe { Self::new_unchecked(buffer, offset, len, validity) })
+    }
+
+    /// Creates a new [`BoolArray`] without validation from these components:
+    ///
+    /// * `buffer` is a raw [`ByteBuffer`] holding the packed bits.
+    /// * `offset` is the number of bits in the start of the buffer that should be skipped when
+    ///   looking up the i-th value.
+    /// * `len` is the length of the array, which should correspond to the number of bits.
+    /// * `validity` holds the null values.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure all of the following invariants are satisfied:
+    ///
+    /// - `buffer` must contain at least `(offset + len).div_ceil(8)` bytes.
+    /// - `offset` must be less than 8 (it represents the bit offset within the first byte).
+    /// - If `validity` is `Validity::Array`, its length must exactly equal `len`.
+    pub unsafe fn new_unchecked(
+        buffer: ByteBuffer,
+        offset: usize,
+        len: usize,
+        validity: Validity,
+    ) -> Self {
+        #[cfg(debug_assertions)]
+        Self::validate(&buffer, offset, len, &validity)
+            .vortex_expect("[Debug Assertion]: Invalid `BoolArray` parameters");
+
+        let buffer = BitBuffer::new_with_offset(buffer, len, offset);
+        let buffer = buffer.shrink_offset();
+        Self {
+            dtype: DType::Bool(validity.nullability()),
+            buffer,
+            validity,
+            stats_set: ArrayStats::default(),
+        }
+    }
+
+    /// Validates the components that would be used to create a [`BoolArray`].
+    ///
+    /// This function checks all the invariants required by [`BoolArray::new_unchecked`].
+    pub fn validate(
+        buffer: &ByteBuffer,
+        offset: usize,
+        len: usize,
+        validity: &Validity,
+    ) -> VortexResult<()> {
+        vortex_ensure!(
+            offset < 8,
+            "offset must be less than whole byte, was {offset} bits"
+        );
+
+        // Validate the buffer is large enough to hold all the bits
+        let required_bytes = offset.saturating_add(len).div_ceil(8);
+        vortex_ensure!(
+            buffer.len() >= required_bytes,
+            "BoolArray with offset={offset} len={len} cannot be built from buffer of size {}",
+            buffer.len()
+        );
+
+        // Validate validity
+        if let Some(validity_len) = validity.maybe_len() {
+            vortex_ensure!(
+                validity_len == len,
+                "BoolArray of size {len} cannot be built with validity of size {validity_len}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Creates a new [`BoolArray`] from a [`BitBuffer`] and [`Validity`] directly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the validity is [`Validity::Array`] and the length is not the same as the buffer.
+    pub fn from_bit_buffer(buffer: BitBuffer, validity: Validity) -> Self {
+        if let Some(validity_len) = validity.maybe_len() {
+            assert_eq!(buffer.len(), validity_len);
+        }
+
+        // Shrink the buffer to remove any whole bytes.
+        let buffer = buffer.shrink_offset();
+        Self {
+            dtype: DType::Bool(validity.nullability()),
+            buffer,
+            validity,
+            stats_set: ArrayStats::default(),
+        }
+    }
+
+    /// Create a new BoolArray from a set of indices and a length.
+    ///
+    /// All indices must be less than the length.
+    pub fn from_indices<I: IntoIterator<Item = usize>>(
+        length: usize,
+        indices: I,
+        validity: Validity,
+    ) -> Self {
+        let mut buffer = BitBufferMut::new_unset(length);
+        indices.into_iter().for_each(|idx| buffer.set(idx));
+        Self::from_bit_buffer(buffer.freeze(), validity)
+    }
+
+    /// Returns the underlying [`BitBuffer`] of the array.
+    pub fn bit_buffer(&self) -> &BitBuffer {
+        assert!(
+            self.buffer.offset() < 8,
+            "Offset must be <8, did we forget to call shrink_offset? Found {}",
+            self.buffer.offset()
+        );
+        &self.buffer
+    }
+
+    /// Returns the underlying [`BitBuffer`] ofthe array
+    pub fn into_bit_buffer(self) -> BitBuffer {
+        self.buffer
+    }
+
+    pub fn to_mask(&self) -> Mask {
+        self.maybe_to_mask()
+            .vortex_expect("cannot convert nullable boolean array to mask")
+    }
+
+    pub fn maybe_to_mask(&self) -> Option<Mask> {
+        self.all_valid()
+            .then(|| Mask::from_buffer(self.bit_buffer().clone()))
+    }
+
+    pub fn to_mask_fill_null_false(&self) -> Mask {
+        if let Some(constant) = self.as_constant() {
+            let bool_constant = constant.as_bool();
+            if bool_constant.value().unwrap_or(false) {
+                return Mask::new_true(self.len());
+            } else {
+                return Mask::new_false(self.len());
+            }
+        }
+        // Extract a boolean buffer, treating null values to false
+        let buffer = match self.validity_mask() {
+            Mask::AllTrue(_) => self.bit_buffer().clone(),
+            Mask::AllFalse(_) => return Mask::new_false(self.len()),
+            Mask::Values(validity) => validity.bit_buffer() & self.bit_buffer(),
+        };
+        Mask::from_buffer(buffer)
+    }
+}
+
+impl From<BitBuffer> for BoolArray {
+    fn from(value: BitBuffer) -> Self {
+        Self::from_bit_buffer(value, Validity::NonNullable)
+    }
+}
+
+impl FromIterator<bool> for BoolArray {
+    fn from_iter<T: IntoIterator<Item = bool>>(iter: T) -> Self {
+        Self::from(BitBuffer::from_iter(iter))
+    }
+}
+
+impl FromIterator<Option<bool>> for BoolArray {
+    fn from_iter<I: IntoIterator<Item = Option<bool>>>(iter: I) -> Self {
+        let (buffer, nulls) = BooleanArray::from_iter(iter).into_parts();
+
+        Self::from_bit_buffer(
+            BitBuffer::from(buffer),
+            nulls
+                .map(|n| Validity::from(BitBuffer::from(n.into_inner())))
+                .unwrap_or(Validity::AllValid),
+        )
+    }
+}
+
+impl IntoArray for BitBuffer {
+    fn into_array(self) -> ArrayRef {
+        let len = self.len();
+        BoolArray::try_new(self.into_inner(), 0, len, Validity::NonNullable)
+            .vortex_expect("known correct")
+            .into_array()
+    }
+}
+
+impl IntoArray for BitBufferMut {
+    fn into_array(self) -> ArrayRef {
+        self.freeze().into_array()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_buffer::{BitBuffer, BitBufferMut, buffer};
+
+    use crate::arrays::{BoolArray, PrimitiveArray};
+    use crate::patches::Patches;
+    use crate::validity::Validity;
+    use crate::vtable::ValidityHelper;
+    use crate::{Array, IntoArray, ToCanonical};
+
+    #[test]
+    fn bool_array() {
+        let arr = BoolArray::from_iter([true, false, true]);
+        let scalar = bool::try_from(&arr.scalar_at(0)).unwrap();
+        assert!(scalar);
+    }
+
+    #[test]
+    fn test_all_some_iter() {
+        let arr = BoolArray::from_iter([Some(true), Some(false)]);
+
+        assert!(matches!(arr.validity(), Validity::AllValid));
+
+        let scalar = bool::try_from(&arr.scalar_at(0)).unwrap();
+        assert!(scalar);
+        let scalar = bool::try_from(&arr.scalar_at(1)).unwrap();
+        assert!(!scalar);
+    }
+
+    #[test]
+    fn test_bool_from_iter() {
+        let arr = BoolArray::from_iter([Some(true), Some(true), None, Some(false), None]);
+
+        let scalar = bool::try_from(&arr.scalar_at(0)).unwrap();
+        assert!(scalar);
+
+        let scalar = bool::try_from(&arr.scalar_at(1)).unwrap();
+        assert!(scalar);
+
+        let scalar = arr.scalar_at(2);
+        assert!(scalar.is_null());
+
+        let scalar = bool::try_from(&arr.scalar_at(3)).unwrap();
+        assert!(!scalar);
+
+        let scalar = arr.scalar_at(4);
+        assert!(scalar.is_null());
+    }
+
+    #[test]
+    fn patch_sliced_bools() {
+        let arr = BoolArray::from(BitBuffer::new_set(12));
+        let sliced = arr.slice(4..12);
+        assert_eq!(sliced.len(), 8);
+        let values = sliced.to_bool().into_bit_buffer().into_mut();
+        assert_eq!(values.len(), 8);
+        assert_eq!(values.as_slice(), &[255, 255]);
+
+        let arr = {
+            let mut builder = BitBufferMut::new_unset(12);
+            (1..12).for_each(|i| builder.set(i));
+            BoolArray::from(builder.freeze())
+        };
+        let sliced = arr.slice(4..12);
+        let sliced_len = sliced.len();
+        let values = sliced.to_bool().into_bit_buffer().into_mut();
+        assert_eq!(values.as_slice(), &[254, 15]);
+
+        // patch the underlying array
+        let patches = Patches::new(
+            arr.len(),
+            0,
+            buffer![4u32].into_array(), // This creates a non-nullable array
+            BoolArray::from(BitBuffer::new_unset(1)).into_array(),
+            None,
+        );
+        let arr = arr.patch(&patches);
+        let arr_len = arr.len();
+        let values = arr.to_bool().into_bit_buffer().into_mut();
+        assert_eq!(values.len(), arr_len);
+        assert_eq!(values.as_slice(), &[238, 15]);
+
+        // the slice should be unchanged
+        let values = sliced.to_bool().into_bit_buffer().into_mut();
+        assert_eq!(values.len(), sliced_len);
+        assert_eq!(values.as_slice(), &[254, 15]); // unchanged
+    }
+
+    #[test]
+    fn slice_array_in_middle() {
+        let arr = BoolArray::from(BitBuffer::new_set(16));
+        let sliced = arr.slice(4..12);
+        let sliced_len = sliced.len();
+        let values = sliced.to_bool().into_bit_buffer().into_mut();
+        assert_eq!(values.len(), sliced_len);
+        assert_eq!(values.as_slice(), &[255, 255]);
+    }
+
+    #[test]
+    fn patch_bools_owned() {
+        let arr = BoolArray::from(BitBuffer::new_set(16));
+        let buf_ptr = arr.bit_buffer().inner().as_ptr();
+
+        let patches = Patches::new(
+            arr.len(),
+            0,
+            PrimitiveArray::new(buffer![0u32], Validity::NonNullable).into_array(),
+            BoolArray::from(BitBuffer::new_unset(1)).into_array(),
+            None,
+        );
+        let arr = arr.patch(&patches);
+        assert_eq!(arr.bit_buffer().inner().as_ptr(), buf_ptr);
+
+        let values = arr.into_bit_buffer();
+        assert_eq!(values.inner().as_slice(), &[254, 255]);
+    }
+
+    #[test]
+    fn patch_sliced_bools_offset() {
+        let arr = BoolArray::from(BitBuffer::new_set(15));
+        let sliced = arr.slice(4..15);
+        let values = sliced.to_bool().into_bit_buffer().into_mut();
+        assert_eq!(values.as_slice(), &[255, 255]);
+    }
+}

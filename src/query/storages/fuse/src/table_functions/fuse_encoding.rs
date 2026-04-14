@@ -52,6 +52,7 @@ use databend_common_native::stat::PageBody;
 use databend_common_native::stat::stat_simple;
 use databend_storages_common_io::MergeIOReader;
 use databend_storages_common_io::ReadSettings;
+use databend_storages_common_table_meta::meta::ColumnMeta;
 use databend_storages_common_table_meta::meta::SegmentInfo;
 use databend_storages_common_table_meta::meta::TableSnapshot;
 use futures::stream;
@@ -242,6 +243,16 @@ impl<'a> FuseEncodingImpl<'a> {
                     )
                     .await?;
                 }
+                FuseStorageFormat::Vortex => {
+                    self.collect_vortex_rows(
+                        table,
+                        snapshot.as_ref(),
+                        &segments_io,
+                        chunk_size,
+                        &mut rows,
+                    )
+                    .await?;
+                }
             }
         }
 
@@ -373,6 +384,71 @@ impl<'a> FuseEncodingImpl<'a> {
                             column_info,
                             rows,
                         );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Vortex FUSE blocks store one file per block; each leaf column's `ColumnMeta::Vortex` holds
+    /// the byte span for that column from the Vortex footer (`segment_map` + layout), see
+    /// `column_vortex_metas_from_bytes` in `io/write/vortex_encode.rs`. We still report per-column
+    /// uncompressed sizes from column statistics when present.
+    #[async_backtrace::framed]
+    async fn collect_vortex_rows(
+        &self,
+        table: &'a FuseTable,
+        snapshot: &TableSnapshot,
+        segments_io: &SegmentsIO,
+        chunk_size: usize,
+        rows: &mut Vec<EncodingRow>,
+    ) -> Result<()> {
+        let schema = table.schema();
+        let fields = schema.fields();
+        let leaf_columns = fields.iter().filter(|f| !f.is_nested()).count().max(1) as u64;
+
+        for chunk in snapshot.segments.chunks(chunk_size) {
+            let segments = segments_io
+                .read_segments::<SegmentInfo>(chunk, false)
+                .await?;
+            for segment in segments {
+                let segment = segment?;
+                for block in segment.blocks.iter() {
+                    let fallback_uncompressed = block.block_size / leaf_columns;
+                    for field in fields {
+                        if field.is_nested() {
+                            continue;
+                        }
+                        if !self.column_matches(field.name()) {
+                            continue;
+                        }
+                        let column_id = field.column_id;
+                        let Some(column_meta) = block.col_metas.get(&column_id) else {
+                            continue;
+                        };
+                        if !matches!(column_meta, ColumnMeta::Vortex(_)) {
+                            continue;
+                        }
+                        let compressed_size = column_meta.read_bytes(&None);
+                        let uncompressed_size = block
+                            .col_stats
+                            .get(&column_id)
+                            .map(|s| s.in_memory_size)
+                            .unwrap_or(fallback_uncompressed);
+
+                        rows.push(EncodingRow {
+                            table_name: table.name().to_string(),
+                            storage_format: FuseStorageFormat::Vortex,
+                            block_location: block.location.0.clone(),
+                            column_name: field.name().to_string(),
+                            column_type: format!("{} (vortex)", field.data_type().sql_name()),
+                            validity_size: None,
+                            compressed_size,
+                            uncompressed_size,
+                            level_one: "Vortex".to_string(),
+                            level_two: Some("FUSE_BLOCK_FILE".to_string()),
+                        });
                     }
                 }
             }

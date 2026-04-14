@@ -147,6 +147,7 @@ impl BloomIndexRebuilder {
             ctx,
             self.table_dal.clone(),
             self.table_schema.clone(),
+            self.storage_format,
             projection,
             false,
             false,

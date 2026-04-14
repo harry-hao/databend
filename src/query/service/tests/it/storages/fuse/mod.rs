@@ -23,4 +23,5 @@ mod pruning_column_oriented_segment;
 mod pruning_pipeline;
 mod statistics;
 mod table;
+mod table_vortex;
 mod utils;

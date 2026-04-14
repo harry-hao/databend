@@ -18,4 +18,5 @@ use crate::io::NativeSourceData;
 pub enum RawDataSource {
     Native(NativeSourceData),
     Parquet(BlockReadResult),
+    Vortex(BlockReadResult),
 }

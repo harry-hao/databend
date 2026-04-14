@@ -1,0 +1,161 @@
+[package]
+name = "vortex-array"
+authors = { workspace = true }
+categories = { workspace = true }
+description = "Vortex in memory columnar data format"
+edition = { workspace = true }
+homepage = { workspace = true }
+include = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+readme = "README.md"
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arbitrary = { workspace = true, optional = true }
+arcref = { workspace = true }
+arrow-arith = { workspace = true }
+arrow-array = { workspace = true, features = ["ffi"] }
+arrow-buffer = { workspace = true }
+arrow-data = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+arrow-string = { workspace = true }
+async-trait = { workspace = true }
+bitvec = { workspace = true }
+cfg-if = { workspace = true }
+enum-iterator = { workspace = true }
+enum-map = { workspace = true }
+flatbuffers = { workspace = true }
+futures = { workspace = true, features = ["alloc", "async-await", "std"] }
+getrandom_v03 = { workspace = true }
+goldenfile = { workspace = true, optional = true }
+humansize = { workspace = true }
+inventory = { workspace = true }
+itertools = { workspace = true }
+log = { workspace = true }
+multiversion = { workspace = true }
+num-traits = { workspace = true }
+num_enum = { workspace = true }
+parking_lot = { workspace = true }
+paste = { workspace = true }
+pin-project-lite = { workspace = true }
+prost = { workspace = true }
+rand = { workspace = true }
+rstest = { workspace = true, optional = true }
+rstest_reuse = { workspace = true, optional = true }
+rustc-hash = { workspace = true }
+serde = { workspace = true, optional = true, features = ["derive"] }
+simdutf8 = { workspace = true }
+static_assertions = { workspace = true }
+tabled = { workspace = true, optional = true, default-features = false, features = [
+    "std",
+] }
+termtree = { workspace = true }
+vortex-buffer = { workspace = true, features = ["arrow"] }
+vortex-compute = { workspace = true, default-features = true }
+vortex-dtype = { workspace = true, features = ["arrow", "serde"] }
+vortex-error = { workspace = true, features = ["prost"] }
+vortex-flatbuffers = { workspace = true, features = ["array"] }
+vortex-io = { workspace = true }
+vortex-mask = { workspace = true }
+vortex-metrics = { workspace = true }
+vortex-proto = { workspace = true, features = ["expr"] }
+vortex-scalar = { workspace = true }
+vortex-session = { workspace = true }
+vortex-utils = { workspace = true }
+vortex-vector = { workspace = true }
+
+[features]
+arbitrary = [
+    "dep:arbitrary",
+    "vortex-dtype/arbitrary",
+    "vortex-scalar/arbitrary",
+]
+canonical_counter = []
+table-display = ["dep:tabled"]
+test-harness = ["dep:goldenfile", "dep:rstest", "dep:rstest_reuse"]
+serde = [
+    "dep:serde",
+    "vortex-buffer/serde",
+    "vortex-dtype/serde",
+    "vortex-error/serde",
+    "vortex-mask/serde",
+]
+
+[dev-dependencies]
+arrow-cast = { workspace = true }
+divan = { workspace = true }
+futures = { workspace = true, features = ["executor"] }
+insta = { workspace = true }
+rstest = { workspace = true }
+vortex-array = { path = ".", features = ["test-harness", "table-display"] }
+
+[[bench]]
+name = "search_sorted"
+harness = false
+
+[[bench]]
+name = "scalar_subtract"
+harness = false
+
+[[bench]]
+name = "compare"
+harness = false
+
+[[bench]]
+name = "take_strings"
+harness = false
+
+[[bench]]
+name = "take_patches"
+harness = false
+
+[[bench]]
+name = "chunk_array_builder"
+harness = false
+
+[[bench]]
+name = "take_struct"
+harness = false
+
+[[bench]]
+name = "scalar_at_struct"
+harness = false
+
+[[bench]]
+name = "varbinview_compact"
+harness = false
+
+[[bench]]
+name = "expr_large_struct_pack"
+path = "benches/expr/large_struct_pack.rs"
+harness = false
+
+[[bench]]
+name = "chunked_dict_builder"
+harness = false
+required-features = ["test-harness"]
+
+[[bench]]
+name = "dict_compress"
+harness = false
+required-features = ["test-harness"]
+
+[[bench]]
+name = "dict_compare"
+harness = false
+required-features = ["test-harness"]
+
+[[bench]]
+name = "dict_mask"
+harness = false

@@ -343,6 +343,7 @@ impl FuseTable {
     pub fn get_max_page_size(&self) -> Option<usize> {
         match self.storage_format {
             FuseStorageFormat::Parquet => None,
+            FuseStorageFormat::Vortex => None,
             FuseStorageFormat::Native => Some(self.get_write_settings().max_page_size),
         }
     }
@@ -1300,6 +1301,9 @@ impl Table for FuseTable {
     }
 
     fn support_virtual_columns(&self) -> bool {
+        // Virtual blocks are read via `ReadBlockContext::read_virtual_data`, which calls the
+        // Parquet merge-IO reader only for `FuseStorageFormat::Parquet`. Keep this Parquet-only
+        // until Vortex has an equivalent virtual-column read path.
         if matches!(self.storage_format, FuseStorageFormat::Parquet) && !self.is_read_only() {
             // ignore persistent system tables {
             if let Ok(database_name) = self.table_info.database_name() {

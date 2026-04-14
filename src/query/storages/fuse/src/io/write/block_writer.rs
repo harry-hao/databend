@@ -108,6 +108,15 @@ pub fn serialize_block_with_column_stats(
             let meta = column_parquet_metas(&result, &schema)?;
             Ok(meta)
         }
+        FuseStorageFormat::Vortex => {
+            let (encoded, meta) = super::vortex_encode::encode_data_blocks_as_vortex(
+                &schema,
+                std::slice::from_ref(&block),
+            )?;
+            buf.clear();
+            buf.extend_from_slice(&encoded);
+            Ok(meta)
+        }
         FuseStorageFormat::Native => {
             let leaf_column_ids = schema.to_leaf_column_ids();
 

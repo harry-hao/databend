@@ -1,0 +1,27 @@
+statement ok
+DROP DATABASE IF EXISTS db_09_0103_vortex
+
+statement ok
+CREATE DATABASE db_09_0103_vortex
+
+statement ok
+USE db_09_0103_vortex
+
+statement ok
+create table t_vortex(a int, b string) engine=fuse storage_format='vortex';
+
+statement ok
+insert into t_vortex values (1, 'x'), (2, 'y');
+
+query I
+select count() from t_vortex
+----
+2
+
+query TT
+select level_one, level_two from fuse_encoding('db_09_0103_vortex', 't_vortex') order by column_name limit 1
+----
+Vortex FUSE_BLOCK_FILE
+
+statement ok
+DROP DATABASE IF EXISTS db_09_0103_vortex

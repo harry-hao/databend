@@ -32,6 +32,7 @@ use log::info;
 
 use super::block_format::FuseNativeBlockFormat;
 use super::block_format::FuseParquetBlockFormat;
+use super::block_format::FuseVortexBlockFormat;
 use super::read_block_context::ReadBlockContext;
 use super::read_data_transform::ReadDataTransform;
 use crate::FuseStorageFormat;
@@ -41,6 +42,7 @@ use crate::io::BlockReader;
 use crate::io::VirtualColumnReader;
 use crate::operations::read::DeserializeDataTransform;
 use crate::operations::read::NativeDeserializeDataTransform;
+use crate::operations::read::VortexDeserializeDataTransform;
 use crate::operations::read::TransformRuntimeFilterWait;
 use crate::operations::read::block_partition_receiver_source::BlockPartitionReceiverSource;
 use crate::operations::read::block_partition_source::BlockPartitionSource;
@@ -94,6 +96,7 @@ pub fn build_fuse_source_pipeline(
     let block_format = match storage_format {
         FuseStorageFormat::Native => FuseNativeBlockFormat::create(),
         FuseStorageFormat::Parquet => FuseParquetBlockFormat::create(),
+        FuseStorageFormat::Vortex => FuseVortexBlockFormat::create(),
     };
     let read_block_context = ReadBlockContext::create(
         ctx.clone(),
@@ -162,6 +165,18 @@ pub fn build_fuse_source_pipeline(
                     transform_output,
                     index_reader.clone(),
                     virtual_reader.clone(),
+                )
+            })?;
+        }
+        FuseStorageFormat::Vortex => {
+            pipeline.add_transform(|transform_input, transform_output| {
+                VortexDeserializeDataTransform::create(
+                    ctx.clone(),
+                    block_reader.clone(),
+                    plan,
+                    transform_input,
+                    transform_output,
+                    index_reader.clone(),
                 )
             })?;
         }

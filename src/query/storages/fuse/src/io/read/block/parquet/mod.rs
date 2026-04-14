@@ -42,6 +42,7 @@ pub use deserialize::column_chunks_to_record_batch;
 pub use row_selection::RowSelection;
 
 use crate::FuseBlockPartInfo;
+use crate::FuseStorageFormat;
 use crate::io::BlockReader;
 use crate::io::read::block::block_reader_merge_io::DataItem;
 
@@ -52,14 +53,36 @@ impl BlockReader {
         column_chunks: HashMap<ColumnId, DataItem>,
         selection: Option<&RowSelection>,
     ) -> databend_common_exception::Result<DataBlock> {
-        self.deserialize_parquet_chunks(
-            part.nums_rows,
-            &part.columns_meta,
-            column_chunks,
-            &part.compression,
-            &part.location,
-            selection,
-        )
+        match self.storage_format {
+            FuseStorageFormat::Parquet => self.deserialize_parquet_chunks(
+                part.nums_rows,
+                &part.columns_meta,
+                column_chunks,
+                &part.compression,
+                &part.location,
+                selection,
+            ),
+            FuseStorageFormat::Native => {
+                if selection.is_some() {
+                    return Err(ErrorCode::Unimplemented(
+                        "FUSE native format does not support row selection in deserialize_part"
+                            .to_string(),
+                    ));
+                }
+                self.deserialize_native_chunks(
+                    &part.location,
+                    part.nums_rows,
+                    &part.columns_meta,
+                    column_chunks,
+                )
+            }
+            FuseStorageFormat::Vortex => self.deserialize_vortex_chunks(
+                part.nums_rows,
+                &part.columns_meta,
+                column_chunks,
+                selection,
+            ),
+        }
     }
 
     pub fn deserialize_parquet_chunks(

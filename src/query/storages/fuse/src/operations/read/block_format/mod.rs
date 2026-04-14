@@ -15,8 +15,10 @@
 mod fuse_block_format;
 mod native;
 mod parquet;
+mod vortex;
 
 pub use fuse_block_format::FuseBlockFormat;
 pub use fuse_block_format::ReadBlockMeta;
 pub use native::FuseNativeBlockFormat;
 pub use parquet::FuseParquetBlockFormat;
+pub use vortex::FuseVortexBlockFormat;
