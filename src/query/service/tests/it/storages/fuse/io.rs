@@ -14,6 +14,7 @@
 
 use databend_common_config::InnerConfig;
 use databend_common_expression::DataBlock;
+use databend_query::storages::fuse::FuseStorageFormat;
 use databend_query::storages::fuse::io::TableMetaLocationGenerator;
 use databend_query::test_kits::TestFixture;
 use databend_storages_common_table_meta::meta::TableSnapshot;
@@ -26,7 +27,7 @@ fn test_meta_locations() -> anyhow::Result<()> {
     let test_prefix = "test_pref";
     let locs = TableMetaLocationGenerator::new(test_prefix.to_owned());
     let test_table_meta_timestamps = TestFixture::default_table_meta_timestamps();
-    let ((path, _ver), _id) = locs.gen_block_location(test_table_meta_timestamps);
+    let ((path, _ver), _id) = locs.gen_block_location(test_table_meta_timestamps, FuseStorageFormat::Parquet);
     assert!(path.starts_with(test_prefix));
     let seg_loc = locs.gen_segment_info_location(test_table_meta_timestamps, false);
     assert!(seg_loc.starts_with(test_prefix));

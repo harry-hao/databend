@@ -323,7 +323,7 @@ fn build_test_segment_info(
     let location_gen = TableMetaLocationGenerator::new("/root/12345/67890".to_owned());
 
     let (block_location, block_uuid) =
-        location_gen.gen_block_location(TestFixture::default_table_meta_timestamps());
+        location_gen.gen_block_location(TestFixture::default_table_meta_timestamps(), FuseStorageFormat::Parquet);
     let block_meta = BlockMeta {
         row_count: 0,
         block_size: 0,

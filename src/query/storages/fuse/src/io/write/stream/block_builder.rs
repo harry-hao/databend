@@ -455,7 +455,10 @@ impl StreamBlockBuilder {
         let (block_location, block_id) = self
             .properties
             .meta_locations
-            .gen_block_location(self.properties.table_meta_timestamps);
+            .gen_block_location(
+                self.properties.table_meta_timestamps,
+                self.properties.write_settings.storage_format,
+            );
 
         let bloom_index_location = self
             .properties
