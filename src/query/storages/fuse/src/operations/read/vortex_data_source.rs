@@ -18,5 +18,5 @@ use crate::io::BlockReadResult;
 
 pub enum VortexDataSource {
     AggIndex((PartInfoPtr, BlockReadResult)),
-    Normal(BlockReadResult),
+    Normal(PartInfoPtr),
 }

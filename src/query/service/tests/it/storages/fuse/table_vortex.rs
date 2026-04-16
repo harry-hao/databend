@@ -120,3 +120,36 @@ async fn test_fuse_vortex_select_minimal() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fuse_vortex_prewhere_two_phase() -> anyhow::Result<()> {
+    let fixture = TestFixture::setup().await?;
+    fixture.create_default_database().await?;
+    let db = fixture.default_db_name();
+
+    // Shape: output only needs `b`, filter needs `a` => should use prewhere/two-phase read.
+    let create = format!(
+        "create table {db}.t_vortex_prewhere(a int, b int) storage_format = 'vortex'"
+    );
+    let insert = format!(
+        "insert into {db}.t_vortex_prewhere values (1, 10),(2, 20),(3, 30),(2, 200)"
+    );
+    let select = format!("select sum(b) from {db}.t_vortex_prewhere where a = 2");
+
+    fixture.execute_command(&create).await?;
+    fixture.execute_command(&insert).await?;
+
+    let stream = fixture.execute_query(&select).await?;
+    let blocks = stream.try_collect::<Vec<DataBlock>>().await?;
+    assert_eq!(blocks.len(), 1, "expected single aggregation result block");
+    let expected = vec![
+        "+----------+",
+        "| Column 0 |",
+        "+----------+",
+        "| 220      |",
+        "+----------+",
+    ];
+    assert_blocks_eq(expected, &blocks);
+
+    Ok(())
+}

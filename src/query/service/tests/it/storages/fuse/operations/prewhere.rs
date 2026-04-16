@@ -55,6 +55,15 @@ use databend_query::test_kits::TestFixture;
 use databend_storages_common_table_meta::meta::ColumnMeta;
 use databend_storages_common_table_meta::meta::Compression;
 use opendal::Buffer;
+use vortex::arrow::FromArrowArray;
+use vortex::file::WriteOptionsSessionExt;
+use vortex::io::runtime::BlockingRuntime;
+use vortex::io::runtime::single::SingleThreadRuntime;
+use vortex::io::session::RuntimeSessionExt;
+use vortex::session::VortexSession;
+use vortex::VortexSessionDefault;
+use vortex_array::ArrayRef as VortexArrayRef;
+use vortex_array::iter::ArrayIteratorAdapter;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prewhere() -> Result<()> {
@@ -133,6 +142,84 @@ async fn test_prewhere() -> Result<()> {
         // Bitmap should reflect the filtering result
         assert_eq!(bitmap.len(), num_rows);
         assert_eq!(bitmap.null_count(), num_rows - 1); // 4 out of 5 rows filtered out
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_prewhere_vortex() -> Result<()> {
+    let PrewhereTestSetup {
+        _fixture,
+        ctx,
+        prewhere_info,
+        block_reader,
+        column_chunks,
+        part,
+        num_rows,
+        scan_id,
+    } = prepare_prewhere_data_vortex().await?;
+    let _ = _fixture;
+
+    // Create ReadState which combines prewhere and runtime filter logic
+    let read_state = ReadState::create(ctx.clone(), scan_id, Some(&prewhere_info), &block_reader)?;
+
+    // Use the unified API that handles all states internally
+    let (data_block, _row_selection, bitmap_selection) =
+        read_state.deserialize_and_filter(column_chunks.clone(), &part)?;
+
+    // Verify the final data_block (all columns in order: x, y, z, d, e)
+    {
+        assert_eq!(data_block.num_rows(), 1);
+        assert_eq!(data_block.num_columns(), 5);
+
+        let col_x: Vec<i32> =
+            Int32Type::try_downcast_column(&data_block.get_by_offset(0).to_column())
+                .unwrap()
+                .iter()
+                .copied()
+                .collect();
+        assert_eq!(col_x, vec![3]);
+
+        let col_y: Vec<i32> =
+            Int32Type::try_downcast_column(&data_block.get_by_offset(1).to_column())
+                .unwrap()
+                .iter()
+                .copied()
+                .collect();
+        assert_eq!(col_y, vec![30]);
+
+        let col_z: Vec<i32> =
+            Int32Type::try_downcast_column(&data_block.get_by_offset(2).to_column())
+                .unwrap()
+                .iter()
+                .copied()
+                .collect();
+        assert_eq!(col_z, vec![300]);
+
+        let col_d: Vec<i32> =
+            Int32Type::try_downcast_column(&data_block.get_by_offset(3).to_column())
+                .unwrap()
+                .iter()
+                .copied()
+                .collect();
+        assert_eq!(col_d, vec![3000]);
+
+        let col_e: Vec<i32> =
+            Int32Type::try_downcast_column(&data_block.get_by_offset(4).to_column())
+                .unwrap()
+                .iter()
+                .copied()
+                .collect();
+        assert_eq!(col_e, vec![7]);
+    }
+
+    // Verify bitmap_selection is present and matches the filtering result.
+    {
+        assert!(bitmap_selection.is_some());
+        let bitmap = bitmap_selection.unwrap();
+        assert_eq!(bitmap.len(), num_rows);
+        assert_eq!(bitmap.null_count(), num_rows - 1);
     }
 
     Ok(())
@@ -379,6 +466,255 @@ async fn prepare_prewhere_data() -> Result<PrewhereTestSetup> {
         num_rows,
         scan_id,
     })
+}
+
+async fn prepare_prewhere_data_vortex() -> Result<PrewhereTestSetup> {
+    let fixture = TestFixture::setup().await?;
+    let ctx = fixture.new_query_ctx().await?;
+
+    // Create schema: x, y, z (prewhere), d-e (remain)
+    let schema: TableSchemaRef = Arc::new(TableSchema::new(vec![
+        TableField::new("x", TableDataType::Number(NumberDataType::Int32)),
+        TableField::new("y", TableDataType::Number(NumberDataType::Int32)),
+        TableField::new("z", TableDataType::Number(NumberDataType::Int32)),
+        TableField::new("d", TableDataType::Number(NumberDataType::Int32)),
+        TableField::new("e", TableDataType::Number(NumberDataType::Int32)),
+    ]));
+
+    // Create test data
+    let values_x: Vec<i32> = vec![1, 2, 3, 4, 5];
+    let values_y: Vec<i32> = vec![10, 20, 30, 40, 50];
+    let values_z: Vec<i32> = vec![100, 200, 300, 400, 500];
+    let values_d: Vec<i32> = vec![1000, 2000, 3000, 4000, 5000];
+    let values_e: Vec<i32> = vec![7, 7, 7, 7, 7];
+    let num_rows = values_x.len();
+
+    let block = DataBlock::new_from_columns(vec![
+        Int32Type::from_data(values_x.clone()),
+        Int32Type::from_data(values_y.clone()),
+        Int32Type::from_data(values_z.clone()),
+        Int32Type::from_data(values_d.clone()),
+        Int32Type::from_data(values_e.clone()),
+    ]);
+
+    // Create operator (memory-based for testing), and write a Vortex file to it.
+    let operator = opendal::Operator::via_iter(opendal::Scheme::Memory, [])?;
+    let vortex_bytes = encode_data_blocks_as_vortex_bytes(&schema, &[block.clone()])?;
+    let column_metas = HashMap::<ColumnId, ColumnMeta>::new();
+    let location = "test_block.vortex";
+    operator.write(location, vortex_bytes).await?;
+
+    // Build filter expression: z == 300 AND x > 2 AND y < 40
+    let col_x_expr: Expr<String> = Expr::ColumnRef(ColumnRef {
+        span: None,
+        id: "x".to_string(),
+        data_type: DataType::Number(NumberDataType::Int32),
+        display_name: "x".to_string(),
+    });
+    let col_y_expr: Expr<String> = Expr::ColumnRef(ColumnRef {
+        span: None,
+        id: "y".to_string(),
+        data_type: DataType::Number(NumberDataType::Int32),
+        display_name: "y".to_string(),
+    });
+    let col_z_expr: Expr<String> = Expr::ColumnRef(ColumnRef {
+        span: None,
+        id: "z".to_string(),
+        data_type: DataType::Number(NumberDataType::Int32),
+        display_name: "z".to_string(),
+    });
+
+    let const_2_expr: Expr<String> = Expr::Constant(Constant {
+        span: None,
+        scalar: Scalar::Number(NumberScalar::Int32(2)),
+        data_type: DataType::Number(NumberDataType::Int32),
+    });
+    let const_40_expr: Expr<String> = Expr::Constant(Constant {
+        span: None,
+        scalar: Scalar::Number(NumberScalar::Int32(40)),
+        data_type: DataType::Number(NumberDataType::Int32),
+    });
+    let const_300_expr: Expr<String> = Expr::Constant(Constant {
+        span: None,
+        scalar: Scalar::Number(NumberScalar::Int32(300)),
+        data_type: DataType::Number(NumberDataType::Int32),
+    });
+
+    let filter_z = check_function(
+        None,
+        "eq",
+        &[],
+        &[col_z_expr, const_300_expr],
+        &BUILTIN_FUNCTIONS,
+    )?;
+    let filter_x = check_function(
+        None,
+        "gt",
+        &[],
+        &[col_x_expr, const_2_expr],
+        &BUILTIN_FUNCTIONS,
+    )?;
+    let filter_y = check_function(
+        None,
+        "lt",
+        &[],
+        &[col_y_expr, const_40_expr],
+        &BUILTIN_FUNCTIONS,
+    )?;
+    let filter_zy = check_function(
+        None,
+        "and_filters",
+        &[],
+        &[filter_z, filter_y],
+        &BUILTIN_FUNCTIONS,
+    )?;
+    let filter_expr = check_function(
+        None,
+        "and_filters",
+        &[],
+        &[filter_zy, filter_x],
+        &BUILTIN_FUNCTIONS,
+    )?;
+
+    let prewhere_info = PrewhereInfo {
+        output_columns: Projection::Columns(vec![0, 1, 2, 3, 4]),
+        prewhere_columns: Projection::Columns(vec![2, 0, 1]),
+        remain_columns: Projection::Columns(vec![3, 4]),
+        filter: filter_expr.as_remote_expr(),
+        virtual_column_ids: None,
+    };
+
+    let block_reader = BlockReader::create(
+        ctx.clone(),
+        operator.clone(),
+        schema.clone(),
+        FuseStorageFormat::Vortex,
+        prewhere_info.output_columns.clone(),
+        false,
+        false,
+        false,
+    )?;
+
+    let write_settings = WriteSettings::default();
+    let compression: Compression = write_settings.table_compression.into();
+
+    // No merge-IO column chunks are used for Vortex; the reader opens via read_at.
+    let column_chunks = HashMap::new();
+
+    let part = FuseBlockPartInfo {
+        location: location.to_string(),
+        bloom_filter_index_location: None,
+        bloom_filter_index_size: 0,
+        spatial_index_location: None,
+        spatial_index_size: 0,
+        create_on: None,
+        nums_rows: num_rows,
+        columns_meta: column_metas.clone(),
+        columns_stat: None,
+        spatial_stats: None,
+        compression,
+        sort_min_max: None,
+        block_meta_index: None,
+        block_file_size: 0,
+    };
+
+    let bloom_y = create_bloom_filter_for_int32(&[30]);
+    let bloom_d = create_bloom_filter_for_int32(&[3000]);
+
+    let scan_id = 999;
+    let mut filters = HashMap::new();
+    filters.insert(
+        scan_id,
+        RuntimeFilterInfo {
+            filters: vec![
+                RuntimeFilterEntry {
+                    id: 0,
+                    probe_expr: Expr::Constant(Constant {
+                        span: None,
+                        scalar: Scalar::Null,
+                        data_type: DataType::Null,
+                    }),
+                    bloom: Some(RuntimeFilterBloom {
+                        column_name: "y".to_string(),
+                        filter: Arc::new(bloom_y),
+                    }),
+                    spatial: None,
+                    inlist: None,
+                    inlist_value_count: 0,
+                    min_max: None,
+                    stats: Arc::new(RuntimeFilterStats::default()),
+                    build_rows: 1,
+                    build_table_rows: None,
+                    enabled: true,
+                },
+                RuntimeFilterEntry {
+                    id: 1,
+                    probe_expr: Expr::Constant(Constant {
+                        span: None,
+                        scalar: Scalar::Null,
+                        data_type: DataType::Null,
+                    }),
+                    bloom: Some(RuntimeFilterBloom {
+                        column_name: "d".to_string(),
+                        filter: Arc::new(bloom_d),
+                    }),
+                    spatial: None,
+                    inlist: None,
+                    inlist_value_count: 0,
+                    min_max: None,
+                    stats: Arc::new(RuntimeFilterStats::default()),
+                    build_rows: 1,
+                    build_table_rows: None,
+                    enabled: true,
+                },
+            ],
+        },
+    );
+    ctx.set_runtime_filter(filters);
+
+    Ok(PrewhereTestSetup {
+        _fixture: fixture,
+        ctx,
+        prewhere_info,
+        block_reader,
+        column_chunks,
+        part,
+        num_rows,
+        scan_id,
+    })
+}
+
+fn encode_data_blocks_as_vortex_bytes(schema: &TableSchemaRef, blocks: &[DataBlock]) -> Result<Vec<u8>> {
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let table = schema.as_ref();
+    let first_batch = blocks[0].clone().to_record_batch(table)?;
+    let first_root = VortexArrayRef::from_arrow(first_batch, false);
+    let dtype = first_root.dtype().clone();
+
+    let schema_arc = schema.clone();
+    let blocks_owned: Vec<DataBlock> = blocks.to_vec();
+    let chunk_iter = std::iter::once(Ok(first_root)).chain((1..blocks_owned.len()).map(move |i| {
+        let batch = blocks_owned[i]
+            .clone()
+            .to_record_batch(schema_arc.as_ref())
+            .map_err(|e| vortex::error::vortex_err!("{e}"))?;
+        Ok(VortexArrayRef::from_arrow(batch, false))
+    }));
+    let array_iter = ArrayIteratorAdapter::new(dtype, chunk_iter);
+
+    let rt = SingleThreadRuntime::default();
+    let session = VortexSession::default().with_handle(rt.handle());
+    let mut buf = Vec::new();
+    session
+        .write_options()
+        .blocking(&rt)
+        .write(&mut buf, array_iter)
+        .map_err(|e| databend_common_exception::ErrorCode::BadBytes(format!("vortex write failed: {e}")))?;
+
+    Ok(buf)
 }
 
 /// Extract column chunks from parquet bytes based on column metadata.

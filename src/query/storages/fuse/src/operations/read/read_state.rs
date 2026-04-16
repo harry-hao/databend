@@ -24,6 +24,7 @@ use databend_common_catalog::plan::Projection;
 use databend_common_catalog::runtime_filter_info::RuntimeBloomFilter;
 use databend_common_catalog::runtime_filter_info::RuntimeFilterStats;
 use databend_common_catalog::table_context::TableContext;
+use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::ColumnId;
 use databend_common_expression::DataBlock;
@@ -208,6 +209,66 @@ impl ReadState {
         let remain_block = self.remain_reader.deserialize_part(
             part,
             remain_columns_chunks,
+            row_selection.as_ref(),
+        )?;
+
+        let mut merged_fields = self.pre_reader.data_fields();
+        merged_fields.extend(self.remain_reader.data_fields());
+        let merged_schema = DataSchema::new(merged_fields);
+
+        preread_block.merge_block(remain_block);
+
+        let data_block = preread_block.resort(&merged_schema, &self.output_schema)?;
+
+        Ok((data_block, row_selection, bitmap_selection))
+    }
+
+    pub fn deserialize_and_filter_vortex(
+        &self,
+        part: &FuseBlockPartInfo,
+    ) -> Result<(DataBlock, Option<RowSelection>, Option<Bitmap>)> {
+        let mut preread_block = self.pre_reader.deserialize_vortex_chunks(
+            &part.location,
+            part.nums_rows,
+            &part.columns_meta,
+            HashMap::new(),
+            None,
+        )?;
+
+        let filter_bitmap = self.filter(&preread_block, part.nums_rows)?;
+        let runtime_filter_bitmap = self.runtime_filter(&preread_block, part.nums_rows)?;
+
+        let bitmap_selection: Option<Bitmap> = match (filter_bitmap, runtime_filter_bitmap) {
+            (Some(filter_bitmap), Some(runtime_filter_bitmap)) => {
+                let rhs: Bitmap = runtime_filter_bitmap.into();
+                Some((filter_bitmap & &rhs).into())
+            }
+            (Some(filter_bitmap), None) => Some(filter_bitmap.into()),
+            (None, Some(runtime_filter_bitmap)) => Some(runtime_filter_bitmap.into()),
+            (None, None) => None,
+        };
+
+        if let Some(ref bitmap) = bitmap_selection
+            && bitmap.len() != part.nums_rows
+        {
+            return Err(ErrorCode::Internal(format!(
+                "Vortex ReadState bitmap length mismatch: expected {}, got {}",
+                part.nums_rows,
+                bitmap.len()
+            )));
+        }
+
+        if let Some(ref bitmap) = bitmap_selection {
+            preread_block = preread_block.filter_with_bitmap(bitmap)?;
+        }
+
+        let row_selection = bitmap_selection.as_ref().map(RowSelection::from);
+
+        let remain_block = self.remain_reader.deserialize_vortex_chunks(
+            &part.location,
+            part.nums_rows,
+            &part.columns_meta,
+            HashMap::new(),
             row_selection.as_ref(),
         )?;
 

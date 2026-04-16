@@ -211,25 +211,24 @@ impl Processor for VortexDeserializeDataTransform {
 
                     self.output_data = Some(block);
                 }
-                VortexDataSource::Normal(data) => {
+                VortexDataSource::Normal(_part) => {
                     let start = Instant::now();
-                    let columns_chunks = data.columns_chunks()?;
                     let fuse_part = FuseBlockPartInfo::from_part(&part)?;
 
-                    let (mut data_block, row_selection, bitmap_selection) =
-                        if let Some(read_state) = &self.read_state {
-                            read_state.deserialize_and_filter(columns_chunks, &fuse_part)?
-                        } else {
-                            let block = self.block_reader.deserialize_vortex_chunks(
-                                fuse_part.nums_rows,
-                                &fuse_part.columns_meta,
-                                columns_chunks,
-                                None,
-                            )?;
-                            (block, None, None)
-                        };
-
-                    let _ = row_selection;
+                    let mut data_block = match &self.read_state {
+                        Some(read_state) => {
+                            let (data_block, _row_selection, _bitmap) =
+                                read_state.deserialize_and_filter_vortex(&fuse_part)?;
+                            data_block
+                        }
+                        None => self.block_reader.deserialize_vortex_chunks(
+                            &fuse_part.location,
+                            fuse_part.nums_rows,
+                            &fuse_part.columns_meta,
+                            std::collections::HashMap::new(),
+                            None,
+                        )?,
+                    };
 
                     metrics_inc_remote_io_deserialize_milliseconds(
                         start.elapsed().as_millis() as u64
@@ -247,18 +246,7 @@ impl Processor for VortexDeserializeDataTransform {
 
                     data_block = data_block.resort(&self.src_schema, &self.output_schema)?;
 
-                    let offsets = if self.block_reader.query_internal_columns() {
-                        bitmap_selection.as_ref().map(|bitmap| {
-                            roaring::RoaringTreemap::from_sorted_iter(
-                                (0..bitmap.len())
-                                    .filter(|i| unsafe { bitmap.get_bit_unchecked(*i) })
-                                    .map(|i| i as u64),
-                            )
-                            .unwrap()
-                        })
-                    } else {
-                        None
-                    };
+                    let offsets = None;
 
                     data_block = add_data_block_meta(
                         data_block,

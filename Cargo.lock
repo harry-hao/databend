@@ -6186,6 +6186,8 @@ dependencies = [
  "unicase",
  "url",
  "uuid",
+ "vortex",
+ "vortex-array",
  "walkdir",
  "wiremock",
  "zip",
