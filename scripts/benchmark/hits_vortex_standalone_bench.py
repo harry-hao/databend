@@ -26,6 +26,16 @@ RUN_QUERIES: List[str] = []
 
 HITS_TSV_GZ = "/Users/haoyu/src/databendlabs/hits/hits.tsv.gz"
 
+DB = "hits_bench"
+TABLE_BASELINE = "hits_fuse"
+TABLE_VORTEX = "hits_vortex"
+
+# Benchmark default: restart per table suite to get cold process state.
+COLD_START_EACH_TABLE = True
+
+FAIL_ON_ANY_CORRECTNESS_MISMATCH = True
+FAIL_ON_ANY_QUERY_ERROR = False
+
 
 def ensure_dir(path: str) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
@@ -65,6 +75,21 @@ def discover_query_files(paths: List[str]) -> List[str]:
 
 def discover_query_dir(dir_path: str) -> List[str]:
     return sorted(str(p) for p in Path(dir_path).glob("*.sql"))
+
+
+def resolve_query_files(databend_dir: str) -> List[str]:
+    qdir = Path(databend_dir) / QUERIES_DIR
+    if not qdir.exists():
+        raise RuntimeError(f"Queries dir not found: {qdir}")
+    if not RUN_QUERIES:
+        return discover_query_dir(str(qdir))
+    files: List[str] = []
+    for stem in RUN_QUERIES:
+        p = qdir / f"{stem}.sql"
+        if not p.exists():
+            raise RuntimeError(f"Query file not found: {p}")
+        files.append(str(p))
+    return files
 
 
 def query_short_name(filename: str) -> str:
@@ -162,6 +187,49 @@ def stop_services_best_effort() -> None:
     time.sleep(1.0)
 
 
+def open_log(run_dir: str, name: str):
+    p = Path(run_dir) / "artifacts" / "logs" / name
+    ensure_dir(str(p.parent))
+    return open(p, "ab", buffering=0)
+
+
+def start_services(
+    meta_bin: str,
+    query_bin: str,
+    meta_cfg: str,
+    query_cfg: str,
+    run_dir: str,
+    cold_start: bool,
+) -> Tuple[subprocess.Popen, subprocess.Popen]:
+    if cold_start:
+        stop_services_best_effort()
+    else:
+        # start only if ports not open
+        if tcp_is_open("127.0.0.1", META_PORT) and tcp_is_open("127.0.0.1", QUERY_PORT):
+            raise RuntimeError("Services already running; start-if-not-running mode not implemented in this revision")
+
+    meta_log = open_log(run_dir, "databend-meta.log")
+    query_log = open_log(run_dir, "databend-query.log")
+
+    meta_p = subprocess.Popen(
+        [meta_bin, "-c", meta_cfg],
+        cwd=run_dir,
+        stdout=meta_log,
+        stderr=meta_log,
+    )
+    wait_tcp("127.0.0.1", META_PORT, timeout_s=60)
+
+    query_p = subprocess.Popen(
+        [query_bin, "-c", query_cfg, "--internal-enable-sandbox-tenant"],
+        cwd=run_dir,
+        stdout=query_log,
+        stderr=query_log,
+    )
+    wait_tcp("127.0.0.1", QUERY_PORT, timeout_s=60)
+
+    return meta_p, query_p
+
+
 def run_sql(
     bendsql_bin: str,
     sql: str,
@@ -172,7 +240,20 @@ def run_sql(
     start = time.monotonic()
     # bendsql flags may evolve; keep it minimal and rely on defaults where possible.
     proc = subprocess.run(
-        [bendsql_bin, "-n", "--host", host, "--port", str(port), "-o", output, "--quote-style", "never"],
+        [
+            bendsql_bin,
+            "-n",
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "-D",
+            DB,
+            "-o",
+            output,
+            "--quote-style",
+            "never",
+        ],
         input=sql,
         text=True,
         capture_output=True,
@@ -365,6 +446,40 @@ def load_hits_table(
         raise RuntimeError(f"ANALYZE TABLE failed for {table}\nstdout:\n{out}\nstderr:\n{err}\n")
 
 
+def init_database(bendsql_bin: str) -> None:
+    # Create DB via default database connection first (DB may not exist yet).
+    # We do it by connecting without -D and sending CREATE DATABASE, but our run_sql always uses -D.
+    # So we create DB using bendsql --query with explicit USE-like statement through a direct call.
+    proc = subprocess.run(
+        [bendsql_bin, "-n", "--host", "127.0.0.1", "--port", str(QUERY_PORT), "-o", "null"],
+        input=f"CREATE DATABASE IF NOT EXISTS {DB};",
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"CREATE DATABASE failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}\n")
+
+
+def reset_table(bendsql_bin: str, table: str) -> None:
+    code, out, err, _ = run_sql(bendsql_bin, f"DROP TABLE IF EXISTS {table} ALL;", output="null")
+    if code != 0:
+        raise RuntimeError(f"DROP TABLE failed for {table}\nstdout:\n{out}\nstderr:\n{err}\n")
+
+
+def create_table_and_load(
+    bendsql_bin: str,
+    table: str,
+    storage_format: str,
+    gz_path: str,
+) -> None:
+    reset_table(bendsql_bin, table)
+    ddl = create_hits_table_sql(table, storage_format=storage_format)
+    code, out, err, _ = run_sql(bendsql_bin, ddl, output="null")
+    if code != 0:
+        raise RuntimeError(f"CREATE TABLE failed for {table}\nSQL:\n{ddl}\nstdout:\n{out}\nstderr:\n{err}\n")
+    load_hits_table(bendsql_bin, table, gz_path)
+
+
 def open_errors_jsonl(run_dir: str):
     p = Path(run_dir) / "artifacts" / "results" / "errors.jsonl"
     ensure_dir(str(p.parent))
@@ -516,7 +631,107 @@ def write_correctness_csv(run_dir: str, rows: List[dict]) -> str:
     return str(path)
 
 
+def compare_fingerprints(
+    baseline: dict,
+    vortex: dict,
+) -> bool:
+    keys = ["row_count", "h_sum", "h_sum2", "h_min", "h_max"]
+    return all(str(baseline.get(k, "")) == str(vortex.get(k, "")) for k in keys)
+
+
+def write_report_md(run_dir: str, mismatches: List[str]) -> str:
+    p = Path(run_dir) / "artifacts" / "results" / "report.md"
+    ensure_dir(str(p.parent))
+    lines: List[str] = []
+    lines.append(f"## Hits Fuse vs Vortex benchmark report\n")
+    lines.append(f"- **DB**: `{DB}`")
+    lines.append(f"- **Baseline table**: `{TABLE_BASELINE}`")
+    lines.append(f"- **Vortex table**: `{TABLE_VORTEX}`")
+    lines.append(f"- **Data**: `{HITS_TSV_GZ}`")
+    lines.append("")
+    lines.append("### Artifacts")
+    lines.append(f"- timings: `artifacts/results/timings.csv`")
+    lines.append(f"- correctness: `artifacts/results/correctness.csv`")
+    lines.append(f"- errors: `artifacts/results/errors.jsonl`")
+    lines.append("")
+    lines.append("### Correctness summary")
+    if mismatches:
+        lines.append(f"- **FAIL**: {len(mismatches)} mismatched queries")
+        for q in mismatches:
+            lines.append(f"  - `{q}`")
+    else:
+        lines.append("- **PASS**: all queries fingerprints match")
+    lines.append("")
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(p)
+
+
+def main() -> int:
+    run_dir = os.getcwd()
+    databend_dir = get_databend_dir()
+    meta_bin, query_bin, bendsql_bin = resolve_release_bins(databend_dir)
+
+    query_files = resolve_query_files(databend_dir)
+
+    ensure_dir(str(Path(run_dir) / "artifacts" / "results"))
+    ensure_dir(str(Path(run_dir) / "databend-data"))
+
+    meta_cfg, query_cfg = materialize_standalone_configs(databend_dir, run_dir)
+
+    # Cold-start + load baseline
+    start_services(meta_bin, query_bin, meta_cfg, query_cfg, run_dir, cold_start=True)
+    init_database(bendsql_bin)
+    create_table_and_load(bendsql_bin, TABLE_BASELINE, storage_format="", gz_path=HITS_TSV_GZ)
+    run_queries_for_table(bendsql_bin, query_files, TABLE_BASELINE, run_dir)
+
+    # Cold-start + load vortex
+    if COLD_START_EACH_TABLE:
+        start_services(meta_bin, query_bin, meta_cfg, query_cfg, run_dir, cold_start=True)
+        init_database(bendsql_bin)
+    create_table_and_load(bendsql_bin, TABLE_VORTEX, storage_format="vortex", gz_path=HITS_TSV_GZ)
+    run_queries_for_table(bendsql_bin, query_files, TABLE_VORTEX, run_dir)
+
+    # Correctness fingerprints: baseline vs vortex
+    correctness_rows: List[dict] = []
+    mismatched: List[str] = []
+    for qf in query_files:
+        qname = query_short_name(qf)
+        sql = load_sql_file(qf)
+        base_fp = fingerprint_query(bendsql_bin, qname, sql, TABLE_BASELINE, run_dir)
+        vortex_fp = fingerprint_query(bendsql_bin, qname, sql, TABLE_VORTEX, run_dir)
+        ok = compare_fingerprints(base_fp, vortex_fp) and base_fp["row_count"] != ""
+        if not ok:
+            mismatched.append(qname)
+        correctness_rows.append(
+            {
+                "query": qname,
+                "status": "PASS" if ok else "FAIL",
+                "baseline_row_count": base_fp["row_count"],
+                "vortex_row_count": vortex_fp["row_count"],
+                "baseline_h_sum": base_fp["h_sum"],
+                "vortex_h_sum": vortex_fp["h_sum"],
+                "baseline_h_sum2": base_fp["h_sum2"],
+                "vortex_h_sum2": vortex_fp["h_sum2"],
+                "baseline_h_min": base_fp["h_min"],
+                "vortex_h_min": vortex_fp["h_min"],
+                "baseline_h_max": base_fp["h_max"],
+                "vortex_h_max": vortex_fp["h_max"],
+            }
+        )
+
+    write_correctness_csv(run_dir, correctness_rows)
+    write_report_md(run_dir, mismatched)
+
+    if mismatched and FAIL_ON_ANY_CORRECTNESS_MISMATCH:
+        return 3
+    # query errors are recorded in errors.jsonl; exit policy may be tightened later.
+    return 0
+
+
 if __name__ == "__main__":
-    sys.stderr.write("hits_vortex_standalone_bench.py: partial implementation (Task 2 in progress)\n")
-    raise SystemExit(2)
+    try:
+        raise SystemExit(main())
+    except Exception as e:
+        sys.stderr.write(f"fatal: {e}\n")
+        raise SystemExit(1)
 
