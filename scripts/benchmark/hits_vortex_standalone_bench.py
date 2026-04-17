@@ -40,6 +40,9 @@ COLD_START_EACH_TABLE = True
 FAIL_ON_ANY_CORRECTNESS_MISMATCH = True
 FAIL_ON_ANY_QUERY_ERROR = False
 
+# Run order: user preference is to run vortex first.
+RUN_VORTEX_FIRST = True
+
 
 def ensure_dir(path: str) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
@@ -514,6 +517,26 @@ def create_table_and_load(
     load_hits_table(bendsql_bin, table, gz_path)
 
 
+def probe_vortex_support(bendsql_bin: str) -> None:
+    # Capability probe: some server builds may not recognize storage_format='vortex'.
+    code, out, err, _ = run_sql_in_db(
+        bendsql_bin,
+        "CREATE TABLE IF NOT EXISTS __vortex_probe(a INT) ENGINE=FUSE storage_format='vortex';",
+        output="null",
+    )
+    if code != 0:
+        if "unknown fuse storage_format" in err.lower():
+            raise RuntimeError(
+                "Server does not support Fuse storage_format='vortex'.\n"
+                "Please rebuild / run a databend-query version that includes vortex storage format support,\n"
+                "or ensure the benchmark script starts the intended release binaries.\n"
+                f"stderr:\n{err}\n"
+            )
+        raise RuntimeError(f"Vortex capability probe failed.\nstdout:\n{out}\nstderr:\n{err}\n")
+    # best-effort cleanup
+    run_sql_in_db(bendsql_bin, "DROP TABLE IF EXISTS __vortex_probe ALL;", output="null")
+
+
 def open_errors_jsonl(run_dir: str):
     p = Path(run_dir) / "artifacts" / "results" / "errors.jsonl"
     ensure_dir(str(p.parent))
@@ -716,25 +739,46 @@ def main() -> int:
     meta_cfg, query_cfg = materialize_standalone_configs(databend_dir, run_dir)
 
     # Cold-start + load baseline
-    sys.stderr.write("Starting services (baseline)...\n")
-    start_services(meta_bin, query_bin, meta_cfg, query_cfg, run_dir, cold_start=True)
-    sys.stderr.write("Creating database...\n")
-    init_database(bendsql_bin)
-    sys.stderr.write(f"Creating+loading {TABLE_BASELINE}...\n")
-    create_table_and_load(bendsql_bin, TABLE_BASELINE, storage_format="", gz_path=HITS_TSV_GZ)
-    sys.stderr.write(f"Running queries on {TABLE_BASELINE}...\n")
-    run_queries_for_table(bendsql_bin, query_files, TABLE_BASELINE, run_dir)
-
-    # Cold-start + load vortex
-    if COLD_START_EACH_TABLE:
-        sys.stderr.write("Restarting services (vortex)...\n")
+    if RUN_VORTEX_FIRST:
+        sys.stderr.write("Starting services (vortex)...\n")
         start_services(meta_bin, query_bin, meta_cfg, query_cfg, run_dir, cold_start=True)
         sys.stderr.write("Creating database...\n")
         init_database(bendsql_bin)
-    sys.stderr.write(f"Creating+loading {TABLE_VORTEX}...\n")
-    create_table_and_load(bendsql_bin, TABLE_VORTEX, storage_format="vortex", gz_path=HITS_TSV_GZ)
-    sys.stderr.write(f"Running queries on {TABLE_VORTEX}...\n")
-    run_queries_for_table(bendsql_bin, query_files, TABLE_VORTEX, run_dir)
+        probe_vortex_support(bendsql_bin)
+        sys.stderr.write(f"Creating+loading {TABLE_VORTEX}...\n")
+        create_table_and_load(bendsql_bin, TABLE_VORTEX, storage_format="vortex", gz_path=HITS_TSV_GZ)
+        sys.stderr.write(f"Running queries on {TABLE_VORTEX}...\n")
+        run_queries_for_table(bendsql_bin, query_files, TABLE_VORTEX, run_dir)
+
+        if COLD_START_EACH_TABLE:
+            sys.stderr.write("Restarting services (baseline)...\n")
+            start_services(meta_bin, query_bin, meta_cfg, query_cfg, run_dir, cold_start=True)
+            sys.stderr.write("Creating database...\n")
+            init_database(bendsql_bin)
+        sys.stderr.write(f"Creating+loading {TABLE_BASELINE}...\n")
+        create_table_and_load(bendsql_bin, TABLE_BASELINE, storage_format="", gz_path=HITS_TSV_GZ)
+        sys.stderr.write(f"Running queries on {TABLE_BASELINE}...\n")
+        run_queries_for_table(bendsql_bin, query_files, TABLE_BASELINE, run_dir)
+    else:
+        sys.stderr.write("Starting services (baseline)...\n")
+        start_services(meta_bin, query_bin, meta_cfg, query_cfg, run_dir, cold_start=True)
+        sys.stderr.write("Creating database...\n")
+        init_database(bendsql_bin)
+        sys.stderr.write(f"Creating+loading {TABLE_BASELINE}...\n")
+        create_table_and_load(bendsql_bin, TABLE_BASELINE, storage_format="", gz_path=HITS_TSV_GZ)
+        sys.stderr.write(f"Running queries on {TABLE_BASELINE}...\n")
+        run_queries_for_table(bendsql_bin, query_files, TABLE_BASELINE, run_dir)
+
+        if COLD_START_EACH_TABLE:
+            sys.stderr.write("Restarting services (vortex)...\n")
+            start_services(meta_bin, query_bin, meta_cfg, query_cfg, run_dir, cold_start=True)
+            sys.stderr.write("Creating database...\n")
+            init_database(bendsql_bin)
+        probe_vortex_support(bendsql_bin)
+        sys.stderr.write(f"Creating+loading {TABLE_VORTEX}...\n")
+        create_table_and_load(bendsql_bin, TABLE_VORTEX, storage_format="vortex", gz_path=HITS_TSV_GZ)
+        sys.stderr.write(f"Running queries on {TABLE_VORTEX}...\n")
+        run_queries_for_table(bendsql_bin, query_files, TABLE_VORTEX, run_dir)
 
     # Correctness fingerprints: baseline vs vortex
     sys.stderr.write("Computing correctness fingerprints...\n")
