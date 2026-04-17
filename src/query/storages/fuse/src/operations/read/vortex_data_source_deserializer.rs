@@ -43,6 +43,8 @@ use super::vortex_data_source::VortexDataSource;
 use crate::fuse_part::FuseBlockPartInfo;
 use crate::io::AggIndexReader;
 use crate::io::BlockReader;
+use crate::io::referenced_field_names;
+use crate::io::translate_expr_to_vortex;
 use crate::operations::read::data_source_with_meta::DataSourceWithMeta;
 
 pub struct VortexDeserializeDataTransform {
@@ -216,11 +218,34 @@ impl Processor for VortexDeserializeDataTransform {
                     let fuse_part = FuseBlockPartInfo::from_part(&part)?;
 
                     let mut data_block = match &self.read_state {
-                        Some(read_state) => {
-                            let (data_block, _row_selection, _bitmap) =
-                                read_state.deserialize_and_filter_vortex(&fuse_part)?;
-                            data_block
-                        }
+                        Some(read_state) => match (&read_state.filters, read_state.runtime_filters.is_empty()) {
+                            (Some(filter), true) => {
+                                match translate_expr_to_vortex(filter, &read_state.prewhere_schema)? {
+                                    Some(vortex_filter) => {
+                                        let extra = referenced_field_names(filter, &read_state.prewhere_schema);
+                                        self.block_reader.deserialize_vortex_chunks_with_scan_filter(
+                                            &fuse_part.location,
+                                            fuse_part.nums_rows,
+                                            &fuse_part.columns_meta,
+                                            std::collections::HashMap::new(),
+                                            None,
+                                            Some(vortex_filter),
+                                            extra,
+                                        )?
+                                    }
+                                    None => {
+                                        let (data_block, _row_selection, _bitmap) =
+                                            read_state.deserialize_and_filter_vortex(&fuse_part)?;
+                                        data_block
+                                    }
+                                }
+                            }
+                            _ => {
+                                let (data_block, _row_selection, _bitmap) =
+                                    read_state.deserialize_and_filter_vortex(&fuse_part)?;
+                                data_block
+                            }
+                        },
                         None => self.block_reader.deserialize_vortex_chunks(
                             &fuse_part.location,
                             fuse_part.nums_rows,

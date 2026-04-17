@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use databend_common_exception::Result;
 
@@ -32,14 +33,18 @@ impl GlobalQueryRuntime {
 
 impl GlobalIORuntime {
     pub fn init(num_cpus: usize) -> Result<()> {
-        let thread_num = std::cmp::max(num_cpus, num_cpus::get() / 2);
-        let thread_num = std::cmp::max(2, thread_num);
+        static INIT: OnceLock<Result<()>> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let thread_num = std::cmp::max(num_cpus, num_cpus::get() / 2);
+            let thread_num = std::cmp::max(2, thread_num);
 
-        GlobalInstance::set(Arc::new(Runtime::with_worker_threads(
-            thread_num,
-            Some("IO-worker".to_owned()),
-        )?));
-        Ok(())
+            GlobalInstance::set(Arc::new(Runtime::with_worker_threads(
+                thread_num,
+                Some("IO-worker".to_owned()),
+            )?));
+            Ok(())
+        })
+        .clone()
     }
 
     pub fn instance() -> Arc<Runtime> {
@@ -49,12 +54,17 @@ impl GlobalIORuntime {
 
 impl GlobalQueryRuntime {
     pub fn init(num_cpus: usize) -> Result<()> {
-        let thread_num = std::cmp::max(num_cpus, num_cpus::get() / 2);
-        let thread_num = std::cmp::max(2, thread_num);
+        static INIT: OnceLock<Result<()>> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let thread_num = std::cmp::max(num_cpus, num_cpus::get() / 2);
+            let thread_num = std::cmp::max(2, thread_num);
 
-        let rt = Runtime::with_worker_threads(thread_num, Some("g-query-worker".to_owned()))?;
-        GlobalInstance::set(Arc::new(GlobalQueryRuntime(rt)));
-        Ok(())
+            let rt =
+                Runtime::with_worker_threads(thread_num, Some("g-query-worker".to_owned()))?;
+            GlobalInstance::set(Arc::new(GlobalQueryRuntime(rt)));
+            Ok(())
+        })
+        .clone()
     }
 
     pub fn instance() -> Arc<GlobalQueryRuntime> {

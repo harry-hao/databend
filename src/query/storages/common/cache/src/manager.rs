@@ -14,6 +14,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -144,14 +145,18 @@ impl CacheManager {
         tenant_id: impl Into<String>,
         ee_mode: bool,
     ) -> Result<()> {
-        let instance = Arc::new(Self::try_new(
-            config,
-            max_server_memory_usage,
-            tenant_id,
-            ee_mode,
-        )?);
-        GlobalInstance::set(instance);
-        Ok(())
+        static INIT: OnceLock<Result<()>> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let instance = Arc::new(Self::try_new(
+                config,
+                max_server_memory_usage,
+                tenant_id,
+                ee_mode,
+            )?);
+            GlobalInstance::set(instance);
+            Ok(())
+        })
+        .clone()
     }
 
     /// Initialize the caches according to the relevant configurations.

@@ -31,6 +31,7 @@ use databend_common_expression::types::Bitmap;
 use databend_storages_common_table_meta::meta::ColumnMeta;
 use vortex::arrow::IntoArrowArray;
 use vortex::dtype::FieldNames;
+use vortex::expr::Expression;
 use vortex::expr::root;
 use vortex::expr::select;
 use vortex::iter::ArrayIteratorExt;
@@ -56,6 +57,27 @@ impl BlockReader {
         _column_metas: &HashMap<ColumnId, ColumnMeta>,
         column_chunks: HashMap<ColumnId, DataItem>,
         selection: Option<&RowSelection>,
+    ) -> Result<DataBlock> {
+        self.deserialize_vortex_chunks_with_scan_filter(
+            block_path,
+            num_rows,
+            _column_metas,
+            column_chunks,
+            selection,
+            None,
+            None,
+        )
+    }
+
+    pub fn deserialize_vortex_chunks_with_scan_filter(
+        &self,
+        block_path: &str,
+        num_rows: usize,
+        _column_metas: &HashMap<ColumnId, ColumnMeta>,
+        column_chunks: HashMap<ColumnId, DataItem>,
+        selection: Option<&RowSelection>,
+        scan_filter: Option<Expression>,
+        extra_projection: Option<FieldNames>,
     ) -> Result<DataBlock> {
         let result_rows = selection.map(|s| s.selected_rows).unwrap_or(num_rows);
 
@@ -87,23 +109,43 @@ impl BlockReader {
             .iter()
             .map(|p| p[0].as_str())
             .collect::<Vec<_>>();
-        let projection = FieldNames::from_iter(top_level_names);
+        let mut projection_vec = top_level_names
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        if let Some(extra) = extra_projection {
+            for f in extra.iter() {
+                let f = f.to_string();
+                if !projection_vec.iter().any(|x| x == &f) {
+                    projection_vec.push(f);
+                }
+            }
+        }
+        let projection = FieldNames::from_iter(projection_vec.iter().map(|s| s.as_str()));
 
+        let scan_filter_present = scan_filter.is_some();
         let mut record_batch = decode_vortex_file_to_record_batch(
             self.operator.clone(),
             block_path,
-            num_rows,
             Some(projection),
+            scan_filter,
         )?;
 
-        if record_batch.num_rows() != num_rows {
+        // When a scan filter is applied, Vortex may return fewer rows than the on-disk footer count.
+        let result_rows = record_batch.num_rows();
+        if result_rows > num_rows {
             return Err(ErrorCode::BadBytes(format!(
-                "FUSE storage_format='vortex' row count mismatch: metadata {num_rows}, decoded {}",
-                record_batch.num_rows()
+                "FUSE storage_format='vortex' decoded rows {result_rows} exceeds metadata {num_rows}",
             )));
         }
 
         if let Some(selection) = selection {
+            if scan_filter_present {
+                return Err(ErrorCode::BadBytes(
+                    "FUSE storage_format='vortex' unexpected combination: scan_filter + row_selection"
+                        .to_string(),
+                ));
+            }
             let predicate = bitmap_to_boolean_array(&selection.bitmap)?;
             record_batch = filter_record_batch(&record_batch, &predicate).map_err(|e| {
                 ErrorCode::BadBytes(format!(
@@ -126,17 +168,17 @@ impl BlockReader {
                 Some(arrow_array) => Value::from_arrow_rs(arrow_array, &data_type)?,
                 None => Value::Scalar(self.default_vals[i].clone()),
             };
-            entries.push(BlockEntry::new(value, || (data_type, result_rows)));
+            entries.push(BlockEntry::new(value, || (data_type, record_batch.num_rows())));
         }
-        Ok(DataBlock::new(entries, result_rows))
+        Ok(DataBlock::new(entries, record_batch.num_rows()))
     }
 }
 
 fn decode_vortex_file_to_record_batch(
     operator: opendal::Operator,
     location: &str,
-    expected_rows: usize,
     projection: Option<FieldNames>,
+    scan_filter: Option<Expression>,
 ) -> Result<RecordBatch> {
     let rt = SingleThreadRuntime::default();
     let session = VortexSession::default().with_handle(rt.handle());
@@ -158,18 +200,16 @@ fn decode_vortex_file_to_record_batch(
                 })
         })?;
 
-    if file.row_count() as usize != expected_rows {
-        return Err(ErrorCode::BadBytes(format!(
-            "FUSE storage_format='vortex' row count mismatch: metadata {expected_rows}, footer {}",
-            file.row_count()
-        )));
-    }
-
     let scan = file.scan().map_err(|e| {
         ErrorCode::BadBytes(format!(
             "FUSE storage_format='vortex' failed to begin scan: {e}"
         ))
     })?;
+
+    let scan = match scan_filter {
+        Some(filter) => scan.with_filter(filter),
+        None => scan,
+    };
 
     let scan = match projection {
         Some(fields) => scan.with_projection(select(fields, root())),

@@ -21,6 +21,7 @@ mod block_reader_native_deserialize;
 mod block_reader_parquet_deserialize;
 pub mod parquet;
 mod vortex_deserialize;
+pub(crate) mod vortex_predicate;
 mod vortex_read_at;
 
 pub use block_reader::BlockReadContext;
@@ -31,3 +32,5 @@ pub use block_reader_native::NativeReaderExt;
 pub use block_reader_native::NativeSourceData;
 pub use parquet::RowSelection;
 pub use parquet::column_chunks_to_record_batch;
+pub use vortex_predicate::translate_expr_to_vortex;
+pub use vortex_predicate::referenced_field_names;

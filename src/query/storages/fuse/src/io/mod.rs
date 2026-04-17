@@ -31,6 +31,8 @@ pub use read::MetaReaders;
 pub use read::NativeReaderExt;
 pub use read::NativeSourceData;
 pub use read::RowSelection;
+pub use read::referenced_field_names;
+pub use read::translate_expr_to_vortex;
 pub use read::SnapshotHistoryReader;
 pub use read::TableSnapshotReader;
 pub use read::VirtualBlockReadResult;

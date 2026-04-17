@@ -153,3 +153,39 @@ async fn test_fuse_vortex_prewhere_two_phase() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fuse_vortex_filter_pushdown_subset() -> anyhow::Result<()> {
+    let fixture = TestFixture::setup().await?;
+    fixture.create_default_database().await?;
+    let db = fixture.default_db_name();
+
+    // Filter is a conjunction of comparisons + is_not_null, excluding IN/LIKE.
+    // Also ensures filter references a column (`a`) not present in output projection.
+    let create = format!(
+        "create table {db}.t_vortex_pushdown(a int, b int, c int) storage_format = 'vortex'"
+    );
+    let insert = format!(
+        "insert into {db}.t_vortex_pushdown values (1, 10, NULL),(2, 20, 1),(2, 200, 2),(3, 30, 3)"
+    );
+    let select = format!(
+        "select sum(b) from {db}.t_vortex_pushdown where a = 2 and b > 10 and c is not null"
+    );
+
+    fixture.execute_command(&create).await?;
+    fixture.execute_command(&insert).await?;
+
+    let stream = fixture.execute_query(&select).await?;
+    let blocks = stream.try_collect::<Vec<DataBlock>>().await?;
+    assert_eq!(blocks.len(), 1, "expected single aggregation result block");
+    let expected = vec![
+        "+----------+",
+        "| Column 0 |",
+        "+----------+",
+        "| 220      |",
+        "+----------+",
+    ];
+    assert_blocks_eq(expected, &blocks);
+
+    Ok(())
+}
