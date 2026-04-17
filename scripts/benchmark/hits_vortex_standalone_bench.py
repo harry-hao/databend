@@ -439,7 +439,8 @@ def copy_into_hits_sql(table: str, gz_path: str) -> str:
     # If this fails in practice, the script will surface the server-side error and stop.
     # Databend COPY supports local filesystem URIs via fs:///abs/path (not file://).
     p = Path(gz_path).expanduser().resolve()
-    url = f"fs://{p.as_posix()}" if p.as_posix().startswith("/") else f"fs:///{p.as_posix()}"
+    # Normalize to exactly fs:///abs/path
+    url = f"fs:///{p.as_posix().lstrip('/')}"
     return (
         f"COPY INTO {table} FROM '{url}' "
         "FILE_FORMAT=(type=TSV compression=GZIP field_delimiter='\\t' record_delimiter='\\n' skip_header=1);"
@@ -696,6 +697,9 @@ def main() -> int:
     meta_bin, query_bin, bendsql_bin = resolve_release_bins(databend_dir)
 
     query_files = resolve_query_files(databend_dir)
+    sys.stderr.write(f"Running in: {run_dir}\n")
+    sys.stderr.write(f"Using DATABEND_DIR: {databend_dir}\n")
+    sys.stderr.write(f"Queries: {len(query_files)}\n")
 
     ensure_dir(str(Path(run_dir) / "artifacts" / "results"))
     ensure_dir(str(Path(run_dir) / "databend-data"))
@@ -703,19 +707,28 @@ def main() -> int:
     meta_cfg, query_cfg = materialize_standalone_configs(databend_dir, run_dir)
 
     # Cold-start + load baseline
+    sys.stderr.write("Starting services (baseline)...\n")
     start_services(meta_bin, query_bin, meta_cfg, query_cfg, run_dir, cold_start=True)
+    sys.stderr.write("Creating database...\n")
     init_database(bendsql_bin)
+    sys.stderr.write(f"Creating+loading {TABLE_BASELINE}...\n")
     create_table_and_load(bendsql_bin, TABLE_BASELINE, storage_format="", gz_path=HITS_TSV_GZ)
+    sys.stderr.write(f"Running queries on {TABLE_BASELINE}...\n")
     run_queries_for_table(bendsql_bin, query_files, TABLE_BASELINE, run_dir)
 
     # Cold-start + load vortex
     if COLD_START_EACH_TABLE:
+        sys.stderr.write("Restarting services (vortex)...\n")
         start_services(meta_bin, query_bin, meta_cfg, query_cfg, run_dir, cold_start=True)
+        sys.stderr.write("Creating database...\n")
         init_database(bendsql_bin)
+    sys.stderr.write(f"Creating+loading {TABLE_VORTEX}...\n")
     create_table_and_load(bendsql_bin, TABLE_VORTEX, storage_format="vortex", gz_path=HITS_TSV_GZ)
+    sys.stderr.write(f"Running queries on {TABLE_VORTEX}...\n")
     run_queries_for_table(bendsql_bin, query_files, TABLE_VORTEX, run_dir)
 
     # Correctness fingerprints: baseline vs vortex
+    sys.stderr.write("Computing correctness fingerprints...\n")
     correctness_rows: List[dict] = []
     mismatched: List[str] = []
     for qf in query_files:
