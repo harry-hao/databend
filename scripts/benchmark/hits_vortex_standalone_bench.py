@@ -238,7 +238,36 @@ def run_sql(
     output: str = "null",
 ) -> Tuple[int, str, str, int]:
     start = time.monotonic()
-    # bendsql flags may evolve; keep it minimal and rely on defaults where possible.
+    # bendsql executes SQL via --query (stdin/-d is for loading data, not SQL execution).
+    proc = subprocess.run(
+        [
+            bendsql_bin,
+            "-n",
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "-o",
+            output,
+            "--quote-style",
+            "never",
+            f"--query={sql}",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    dur_ms = int((time.monotonic() - start) * 1000)
+    return proc.returncode, proc.stdout, proc.stderr, dur_ms
+
+
+def run_sql_in_db(
+    bendsql_bin: str,
+    sql: str,
+    host: str = "127.0.0.1",
+    port: int = QUERY_PORT,
+    output: str = "null",
+) -> Tuple[int, str, str, int]:
+    start = time.monotonic()
     proc = subprocess.run(
         [
             bendsql_bin,
@@ -253,8 +282,8 @@ def run_sql(
             output,
             "--quote-style",
             "never",
+            f"--query={sql}",
         ],
-        input=sql,
         text=True,
         capture_output=True,
     )
@@ -273,7 +302,7 @@ def run_sql_tsv_single_row(
     host: str = "127.0.0.1",
     port: int = QUERY_PORT,
 ) -> List[str]:
-    code, out, err, _ = run_sql(bendsql_bin, sql, host=host, port=port, output="tsv")
+    code, out, err, _ = run_sql_in_db(bendsql_bin, sql, host=host, port=port, output="tsv")
     if code != 0:
         raise RuntimeError(f"SQL failed:\n{sql}\nstdout:\n{out}\nstderr:\n{err}\n")
     rows = parse_tsv_table(out)
@@ -408,7 +437,9 @@ def create_hits_table_sql(table: str, storage_format: str = "") -> str:
 def copy_into_hits_sql(table: str, gz_path: str) -> str:
     # Prefer Databend reading gzip directly from local file URL.
     # If this fails in practice, the script will surface the server-side error and stop.
-    url = Path(gz_path).expanduser().resolve().as_uri()
+    # Databend COPY supports local filesystem URIs via fs:///abs/path (not file://).
+    p = Path(gz_path).expanduser().resolve()
+    url = f"fs://{p.as_posix()}" if p.as_posix().startswith("/") else f"fs:///{p.as_posix()}"
     return (
         f"COPY INTO {table} FROM '{url}' "
         "FILE_FORMAT=(type=TSV field_delimiter='\\t' record_delimiter='\\n' skip_header=1);"
@@ -432,7 +463,7 @@ def load_hits_table(
 ) -> None:
     # Capability probe: attempt a tiny load into target table (real load); fail fast with clear error.
     sql = copy_into_hits_sql(table, gz_path)
-    code, out, err, _ = run_sql(bendsql_bin, sql, host=host, port=port, output="null")
+    code, out, err, _ = run_sql_in_db(bendsql_bin, sql, host=host, port=port, output="null")
     if code != 0:
         raise RuntimeError(
             "COPY INTO failed for local .tsv.gz.\n"
@@ -441,27 +472,20 @@ def load_hits_table(
             f"stderr:\n{err}\n"
         )
 
-    code, out, err, _ = run_sql(bendsql_bin, analyze_table_sql(table), host=host, port=port, output="null")
+    code, out, err, _ = run_sql_in_db(bendsql_bin, analyze_table_sql(table), host=host, port=port, output="null")
     if code != 0:
         raise RuntimeError(f"ANALYZE TABLE failed for {table}\nstdout:\n{out}\nstderr:\n{err}\n")
 
 
 def init_database(bendsql_bin: str) -> None:
     # Create DB via default database connection first (DB may not exist yet).
-    # We do it by connecting without -D and sending CREATE DATABASE, but our run_sql always uses -D.
-    # So we create DB using bendsql --query with explicit USE-like statement through a direct call.
-    proc = subprocess.run(
-        [bendsql_bin, "-n", "--host", "127.0.0.1", "--port", str(QUERY_PORT), "-o", "null"],
-        input=f"CREATE DATABASE IF NOT EXISTS {DB};",
-        text=True,
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"CREATE DATABASE failed\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}\n")
+    code, out, err, _ = run_sql(bendsql_bin, f"CREATE DATABASE IF NOT EXISTS {DB};", output="null")
+    if code != 0:
+        raise RuntimeError(f"CREATE DATABASE failed\nstdout:\n{out}\nstderr:\n{err}\n")
 
 
 def reset_table(bendsql_bin: str, table: str) -> None:
-    code, out, err, _ = run_sql(bendsql_bin, f"DROP TABLE IF EXISTS {table} ALL;", output="null")
+    code, out, err, _ = run_sql_in_db(bendsql_bin, f"DROP TABLE IF EXISTS {table} ALL;", output="null")
     if code != 0:
         raise RuntimeError(f"DROP TABLE failed for {table}\nstdout:\n{out}\nstderr:\n{err}\n")
 
@@ -474,7 +498,7 @@ def create_table_and_load(
 ) -> None:
     reset_table(bendsql_bin, table)
     ddl = create_hits_table_sql(table, storage_format=storage_format)
-    code, out, err, _ = run_sql(bendsql_bin, ddl, output="null")
+    code, out, err, _ = run_sql_in_db(bendsql_bin, ddl, output="null")
     if code != 0:
         raise RuntimeError(f"CREATE TABLE failed for {table}\nSQL:\n{ddl}\nstdout:\n{out}\nstderr:\n{err}\n")
     load_hits_table(bendsql_bin, table, gz_path)
@@ -513,7 +537,7 @@ def run_query_3_times(
     timings_csv = str(Path(run_dir) / "artifacts" / "results" / "timings.csv")
     with open_errors_jsonl(run_dir) as errfp:
         for run_idx in (1, 2, 3):
-            code, out, err, dur_ms = run_sql(bendsql_bin, sql, host=host, port=port)
+            code, out, err, dur_ms = run_sql_in_db(bendsql_bin, sql, host=host, port=port, output="null")
             ok = code == 0
             append_timing_csv_row(
                 timings_csv,
