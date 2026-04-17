@@ -442,7 +442,7 @@ def copy_into_hits_sql(table: str, gz_path: str) -> str:
     url = f"fs://{p.as_posix()}" if p.as_posix().startswith("/") else f"fs:///{p.as_posix()}"
     return (
         f"COPY INTO {table} FROM '{url}' "
-        "FILE_FORMAT=(type=TSV field_delimiter='\\t' record_delimiter='\\n' skip_header=1);"
+        "FILE_FORMAT=(type=TSV compression=GZIP field_delimiter='\\t' record_delimiter='\\n' skip_header=1);"
     )
 
 
