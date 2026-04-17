@@ -162,17 +162,44 @@ def stop_services_best_effort() -> None:
     time.sleep(1.0)
 
 
-def run_sql(bendsql_bin: str, sql: str, host: str = "127.0.0.1", port: int = QUERY_PORT) -> Tuple[int, str, str, int]:
+def run_sql(
+    bendsql_bin: str,
+    sql: str,
+    host: str = "127.0.0.1",
+    port: int = QUERY_PORT,
+    output: str = "null",
+) -> Tuple[int, str, str, int]:
     start = time.monotonic()
     # bendsql flags may evolve; keep it minimal and rely on defaults where possible.
     proc = subprocess.run(
-        [bendsql_bin, "--host", host, "--port", str(port)],
+        [bendsql_bin, "-n", "--host", host, "--port", str(port), "-o", output, "--quote-style", "never"],
         input=sql,
         text=True,
         capture_output=True,
     )
     dur_ms = int((time.monotonic() - start) * 1000)
     return proc.returncode, proc.stdout, proc.stderr, dur_ms
+
+
+def parse_tsv_table(text: str) -> List[List[str]]:
+    lines = [ln for ln in text.splitlines() if ln.strip() != ""]
+    return [ln.split("\t") for ln in lines]
+
+
+def run_sql_tsv_single_row(
+    bendsql_bin: str,
+    sql: str,
+    host: str = "127.0.0.1",
+    port: int = QUERY_PORT,
+) -> List[str]:
+    code, out, err, _ = run_sql(bendsql_bin, sql, host=host, port=port, output="tsv")
+    if code != 0:
+        raise RuntimeError(f"SQL failed:\n{sql}\nstdout:\n{out}\nstderr:\n{err}\n")
+    rows = parse_tsv_table(out)
+    if len(rows) < 2:
+        raise RuntimeError(f"Expected TSV with header+row, got:\n{out}")
+    # first line is header
+    return rows[1]
 
 
 def hits_schema_columns_sql() -> str:
@@ -324,7 +351,7 @@ def load_hits_table(
 ) -> None:
     # Capability probe: attempt a tiny load into target table (real load); fail fast with clear error.
     sql = copy_into_hits_sql(table, gz_path)
-    code, out, err, _ = run_sql(bendsql_bin, sql, host=host, port=port)
+    code, out, err, _ = run_sql(bendsql_bin, sql, host=host, port=port, output="null")
     if code != 0:
         raise RuntimeError(
             "COPY INTO failed for local .tsv.gz.\n"
@@ -333,7 +360,7 @@ def load_hits_table(
             f"stderr:\n{err}\n"
         )
 
-    code, out, err, _ = run_sql(bendsql_bin, analyze_table_sql(table), host=host, port=port)
+    code, out, err, _ = run_sql(bendsql_bin, analyze_table_sql(table), host=host, port=port, output="null")
     if code != 0:
         raise RuntimeError(f"ANALYZE TABLE failed for {table}\nstdout:\n{out}\nstderr:\n{err}\n")
 
@@ -409,6 +436,84 @@ def run_queries_for_table(
         sql = load_sql_file(qf)
         sql = substitute_hits_table(sql, table)
         run_query_3_times(bendsql_bin, name, sql, table, run_dir)
+
+
+def fingerprint_sql(sql: str, table: str) -> str:
+    q = substitute_hits_table(sql, table).rstrip().rstrip(";")
+    return (
+        "WITH q AS (\n"
+        f"{q}\n"
+        ")\n"
+        "SELECT\n"
+        "  count(*) AS row_count,\n"
+        "  sum(row_h) AS h_sum,\n"
+        "  sum(row_h * 1315423911) AS h_sum2,\n"
+        "  min(row_h) AS h_min,\n"
+        "  max(row_h) AS h_max\n"
+        "FROM (\n"
+        "  SELECT xxhash64(*) AS row_h\n"
+        "  FROM q\n"
+        ") t"
+    )
+
+
+def fingerprint_query(
+    bendsql_bin: str,
+    query_name: str,
+    sql: str,
+    table: str,
+    run_dir: str,
+    host: str = "127.0.0.1",
+    port: int = QUERY_PORT,
+) -> dict:
+    fp_sql = fingerprint_sql(sql, table)
+    try:
+        row = run_sql_tsv_single_row(bendsql_bin, fp_sql, host=host, port=port)
+        # columns fixed by fingerprint_sql order
+        return {
+            "query": query_name,
+            "table": table,
+            "row_count": row[0],
+            "h_sum": row[1],
+            "h_sum2": row[2],
+            "h_min": row[3],
+            "h_max": row[4],
+        }
+    except Exception as e:
+        with open_errors_jsonl(run_dir) as errfp:
+            append_error_jsonl(
+                errfp,
+                {
+                    "kind": "fingerprint_error",
+                    "query": query_name,
+                    "table": table,
+                    "error": str(e),
+                },
+            )
+        return {
+            "query": query_name,
+            "table": table,
+            "row_count": "",
+            "h_sum": "",
+            "h_sum2": "",
+            "h_min": "",
+            "h_max": "",
+        }
+
+
+def write_correctness_csv(run_dir: str, rows: List[dict]) -> str:
+    path = Path(run_dir) / "artifacts" / "results" / "correctness.csv"
+    ensure_dir(str(path.parent))
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return str(path)
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    return str(path)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from scripts.benchmark.hits_vortex_standalone_bench import (
     discover_query_files,
     discover_query_dir,
     fingerprint_sql_for_query,
+    fingerprint_sql,
     load_sql_file,
     query_short_name,
     substitute_hits_table,
@@ -34,6 +35,11 @@ class TestHitsVortexStandaloneBench(unittest.TestCase):
         fp = fingerprint_sql_for_query(sql, "hits_fuse")
         self.assertIn("WITH q AS", fp)
         self.assertIn("FROM q", fp)
+
+    def test_new_fingerprint_sql_uses_xxhash64_factory(self):
+        sql = "SELECT COUNT(*) FROM hits;"
+        fp = fingerprint_sql(sql, "hits_fuse")
+        self.assertIn("xxhash64(*)", fp)
 
     def test_discover_query_files_filters_sql(self):
         files = discover_query_files(["/tmp/00.sql", "/tmp/README.md", "/tmp/23.sql"])
