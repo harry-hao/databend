@@ -1,9 +1,14 @@
 import os
+from pathlib import Path
 from typing import List
 
 
 def discover_query_files(paths: List[str]) -> List[str]:
     return [p for p in paths if p.endswith(".sql")]
+
+
+def discover_query_dir(dir_path: str) -> List[str]:
+    return sorted(str(p) for p in Path(dir_path).glob("*.sql"))
 
 
 def query_short_name(filename: str) -> str:

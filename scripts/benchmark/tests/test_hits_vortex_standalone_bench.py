@@ -1,7 +1,11 @@
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 from scripts.benchmark.hits_vortex_standalone_bench import (
     discover_query_files,
+    discover_query_dir,
     fingerprint_sql_for_query,
     load_sql_file,
     query_short_name,
@@ -29,6 +33,15 @@ class TestHitsVortexStandaloneBench(unittest.TestCase):
     def test_discover_query_files_filters_sql(self):
         files = discover_query_files(["/tmp/00.sql", "/tmp/README.md", "/tmp/23.sql"])
         self.assertEqual(files, ["/tmp/00.sql", "/tmp/23.sql"])
+
+    def test_discover_query_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)
+            (p / "00.sql").write_text("SELECT 1;", encoding="utf-8")
+            (p / "23.sql").write_text("SELECT 2;", encoding="utf-8")
+            (p / "note.txt").write_text("x", encoding="utf-8")
+            files = discover_query_dir(str(p))
+            self.assertEqual([os.path.basename(x) for x in files], ["00.sql", "23.sql"])
 
 
 if __name__ == "__main__":
