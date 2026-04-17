@@ -288,6 +288,47 @@ def create_hits_table_sql(table: str, storage_format: str = "") -> str:
     return f"CREATE TRANSIENT TABLE {table} {hits_schema_columns_sql()} {opts} {hits_cluster_by_sql()};"
 
 
+def copy_into_hits_sql(table: str, gz_path: str) -> str:
+    # Prefer Databend reading gzip directly from local file URL.
+    # If this fails in practice, the script will surface the server-side error and stop.
+    url = Path(gz_path).expanduser().resolve().as_uri()
+    return (
+        f"COPY INTO {table} FROM '{url}' "
+        "FILE_FORMAT=(type=TSV field_delimiter='\\t' record_delimiter='\\n' skip_header=1);"
+    )
+
+
+def analyze_table_sql(table: str) -> str:
+    return f"ANALYZE TABLE {table};"
+
+
+def count_table_sql(table: str) -> str:
+    return f"SELECT count(*) AS c FROM {table};"
+
+
+def load_hits_table(
+    bendsql_bin: str,
+    table: str,
+    gz_path: str,
+    host: str = "127.0.0.1",
+    port: int = QUERY_PORT,
+) -> None:
+    # Capability probe: attempt a tiny load into target table (real load); fail fast with clear error.
+    sql = copy_into_hits_sql(table, gz_path)
+    code, out, err, _ = run_sql(bendsql_bin, sql, host=host, port=port)
+    if code != 0:
+        raise RuntimeError(
+            "COPY INTO failed for local .tsv.gz.\n"
+            f"SQL: {sql}\n"
+            f"stdout:\n{out}\n"
+            f"stderr:\n{err}\n"
+        )
+
+    code, out, err, _ = run_sql(bendsql_bin, analyze_table_sql(table), host=host, port=port)
+    if code != 0:
+        raise RuntimeError(f"ANALYZE TABLE failed for {table}\nstdout:\n{out}\nstderr:\n{err}\n")
+
+
 if __name__ == "__main__":
     sys.stderr.write("hits_vortex_standalone_bench.py: partial implementation (Task 2 in progress)\n")
     raise SystemExit(2)
