@@ -1,3 +1,7 @@
+#
+# export DATABEND_DIR="/Users/haoyu/src/databendlabs/databend" && python3 "$DATABEND_DIR/scripts/benchmark/hits_vortex_standalone_bench.py"
+#
+
 import os
 import csv
 import json
@@ -428,10 +432,15 @@ def hits_cluster_by_sql() -> str:
 
 
 def create_hits_table_sql(table: str, storage_format: str = "") -> str:
-    opts = ""
+    # Databend's CREATE TABLE grammar is sensitive to option ordering.
+    # Use: (...) CLUSTER BY (...) ENGINE=FUSE storage_format='vortex'
+    cluster = hits_cluster_by_sql()
     if storage_format:
-        opts = f" ENGINE=FUSE storage_format='{storage_format}'"
-    return f"CREATE TRANSIENT TABLE {table} {hits_schema_columns_sql()} {opts} {hits_cluster_by_sql()};"
+        return (
+            f"CREATE TRANSIENT TABLE {table} {hits_schema_columns_sql()} "
+            f"{cluster} ENGINE=FUSE storage_format='{storage_format}';"
+        )
+    return f"CREATE TRANSIENT TABLE {table} {hits_schema_columns_sql()} {cluster};"
 
 
 def copy_into_hits_sql(table: str, gz_path: str) -> str:
