@@ -24,6 +24,38 @@ RUN_QUERIES: List[str] = []
 HITS_TSV_GZ = "/Users/haoyu/src/databendlabs/hits/hits.tsv.gz"
 
 
+def ensure_dir(path: str) -> None:
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def materialize_standalone_configs(databend_dir: str, run_dir: str) -> Tuple[str, str]:
+    cfg_dir = Path(run_dir) / "artifacts" / "config"
+    ensure_dir(str(cfg_dir))
+
+    meta_src = Path(databend_dir) / META_TOML_TEMPLATE
+    query_src = Path(databend_dir) / QUERY_TOML_TEMPLATE
+
+    meta_dst = cfg_dir / "databend-meta-node-1.toml"
+    query_dst = cfg_dir / "databend-query-node-1.toml"
+
+    shutil.copyfile(meta_src, meta_dst)
+    shutil.copyfile(query_src, query_dst)
+
+    # Minimal, conservative rewrites to keep all state inside run_dir.
+    meta_txt = meta_dst.read_text(encoding="utf-8")
+    meta_txt = meta_txt.replace('dir = "./.databend/logs1"', 'dir = "./artifacts/logs/meta"')
+    meta_txt = meta_txt.replace('raft_dir      = "./.databend/meta1"', 'raft_dir      = "./databend-data/meta1"')
+    meta_dst.write_text(meta_txt, encoding="utf-8")
+
+    query_txt = query_dst.read_text(encoding="utf-8")
+    query_txt = query_txt.replace('dir = "./.databend/logs_1"', 'dir = "./artifacts/logs/query"')
+    query_txt = query_txt.replace('dir = "./.databend/structlog_1"', 'dir = "./artifacts/logs/structlog"')
+    query_txt = query_txt.replace('data_path = "./.databend/stateless_test_data"', 'data_path = "./databend-data/query_storage"')
+    query_dst.write_text(query_txt, encoding="utf-8")
+
+    return str(meta_dst), str(query_dst)
+
+
 def discover_query_files(paths: List[str]) -> List[str]:
     return [p for p in paths if p.endswith(".sql")]
 
