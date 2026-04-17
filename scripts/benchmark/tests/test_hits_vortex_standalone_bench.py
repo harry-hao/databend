@@ -24,6 +24,11 @@ class TestHitsVortexStandaloneBench(unittest.TestCase):
         self.assertIn("FROM hits_vortex", out)
         self.assertNotIn("FROM hits ", out)
 
+    def test_substitute_hits_table_rewrites_join(self):
+        sql = "SELECT * FROM t JOIN hits ON t.id = hits.WatchID;"
+        out = substitute_hits_table(sql, "hits_fuse")
+        self.assertIn("JOIN hits_fuse", out)
+
     def test_fingerprint_sql_wraps_query(self):
         sql = "SELECT COUNT(*) FROM hits;"
         fp = fingerprint_sql_for_query(sql, "hits_fuse")

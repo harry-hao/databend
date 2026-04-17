@@ -1,4 +1,7 @@
 import os
+import csv
+import json
+import re
 import shutil
 import socket
 import subprocess
@@ -76,7 +79,13 @@ def load_sql_file(path: str) -> str:
 
 
 def substitute_hits_table(sql: str, table: str) -> str:
-    return sql.replace("FROM hits", f"FROM {table}")
+    # Replace simple occurrences used by benchmark/hits queries.
+    # Keep it intentionally conservative to avoid rewriting string literals.
+    out = sql
+    out = re.sub(r"\bFROM\s+hits\b", f"FROM {table}", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bJOIN\s+hits\b", f"JOIN {table}", out, flags=re.IGNORECASE)
+    out = re.sub(r",\s*hits\b", f", {table}", out, flags=re.IGNORECASE)
+    return out
 
 
 def fingerprint_sql_for_query(sql: str, table: str) -> str:
@@ -327,6 +336,79 @@ def load_hits_table(
     code, out, err, _ = run_sql(bendsql_bin, analyze_table_sql(table), host=host, port=port)
     if code != 0:
         raise RuntimeError(f"ANALYZE TABLE failed for {table}\nstdout:\n{out}\nstderr:\n{err}\n")
+
+
+def open_errors_jsonl(run_dir: str):
+    p = Path(run_dir) / "artifacts" / "results" / "errors.jsonl"
+    ensure_dir(str(p.parent))
+    return open(p, "a", encoding="utf-8")
+
+
+def append_error_jsonl(fp, obj: dict) -> None:
+    fp.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    fp.flush()
+
+
+def append_timing_csv_row(csv_path: str, row: dict) -> None:
+    ensure_dir(str(Path(csv_path).parent))
+    exists = Path(csv_path).exists()
+    with open(csv_path, "a", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            w.writeheader()
+        w.writerow(row)
+
+
+def run_query_3_times(
+    bendsql_bin: str,
+    query_name: str,
+    sql: str,
+    table: str,
+    run_dir: str,
+    host: str = "127.0.0.1",
+    port: int = QUERY_PORT,
+) -> None:
+    timings_csv = str(Path(run_dir) / "artifacts" / "results" / "timings.csv")
+    with open_errors_jsonl(run_dir) as errfp:
+        for run_idx in (1, 2, 3):
+            code, out, err, dur_ms = run_sql(bendsql_bin, sql, host=host, port=port)
+            ok = code == 0
+            append_timing_csv_row(
+                timings_csv,
+                {
+                    "query": query_name,
+                    "table": table,
+                    "run_idx": run_idx,
+                    "duration_ms": dur_ms,
+                    "ok": int(ok),
+                },
+            )
+            if not ok:
+                append_error_jsonl(
+                    errfp,
+                    {
+                        "kind": "query_error",
+                        "query": query_name,
+                        "table": table,
+                        "run_idx": run_idx,
+                        "exit_code": code,
+                        "stderr": err[-4000:],
+                        "stdout": out[-4000:],
+                    },
+                )
+
+
+def run_queries_for_table(
+    bendsql_bin: str,
+    query_files: List[str],
+    table: str,
+    run_dir: str,
+) -> None:
+    for qf in query_files:
+        name = query_short_name(qf)
+        sql = load_sql_file(qf)
+        sql = substitute_hits_table(sql, table)
+        run_query_3_times(bendsql_bin, name, sql, table, run_dir)
 
 
 if __name__ == "__main__":
