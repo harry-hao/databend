@@ -9,3 +9,7 @@ JEMALLOC_SYS_WITH_MALLOC_CONF = "percpu_arena:percpu,oversize_threshold:0,backgr
 [target.'cfg(target_os = "linux")']
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "link-arg=-flto=thin"]
+
+[target.'cfg(target_os = "darwin")']
+linker = "/opt/homebrew/opt/llvm/bin/clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-g"]
