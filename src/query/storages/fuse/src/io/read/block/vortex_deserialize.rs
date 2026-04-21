@@ -36,6 +36,7 @@ use vortex::expr::root;
 use vortex::expr::select;
 use vortex::iter::ArrayIteratorExt;
 use vortex::file::OpenOptionsSessionExt;
+use vortex::file::VortexFile;
 use vortex::io::runtime::single::SingleThreadRuntime;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
@@ -174,14 +175,19 @@ impl BlockReader {
     }
 }
 
-fn decode_vortex_file_to_record_batch(
-    operator: opendal::Operator,
-    location: &str,
-    projection: Option<FieldNames>,
-    scan_filter: Option<Expression>,
-) -> Result<RecordBatch> {
+/// Holds a single opened Vortex block file together with the runtime and session used to open it,
+/// so scan/decode can be performed (once or multiple times) without reopening the underlying file.
+struct OpenedVortexFile {
+    rt: SingleThreadRuntime,
+    #[allow(dead_code)]
+    session: VortexSession,
+    file: VortexFile,
+}
+
+fn open_vortex_file(operator: opendal::Operator, location: &str) -> Result<OpenedVortexFile> {
     let rt = SingleThreadRuntime::default();
     let session = VortexSession::default().with_handle(rt.handle());
+    let session_for_open = session.clone();
     let file = GlobalIORuntime::instance()
         .block_on(async move {
             let read_at = OpendalReadAt::open(operator, location).await.map_err(|e| {
@@ -189,7 +195,7 @@ fn decode_vortex_file_to_record_batch(
                     "FUSE storage_format='vortex' failed to build read_at for {location}: {e}"
                 ))
             })?;
-            session
+            session_for_open
                 .open_options()
                 .open_read_at(read_at)
                 .await
@@ -200,7 +206,15 @@ fn decode_vortex_file_to_record_batch(
                 })
         })?;
 
-    let scan = file.scan().map_err(|e| {
+    Ok(OpenedVortexFile { rt, session, file })
+}
+
+fn scan_opened_vortex_file_to_record_batch(
+    opened: &OpenedVortexFile,
+    projection: Option<FieldNames>,
+    scan_filter: Option<Expression>,
+) -> Result<RecordBatch> {
+    let scan = opened.file.scan().map_err(|e| {
         ErrorCode::BadBytes(format!(
             "FUSE storage_format='vortex' failed to begin scan: {e}"
         ))
@@ -217,7 +231,7 @@ fn decode_vortex_file_to_record_batch(
     };
 
     let array_ref = scan
-        .into_array_iter(&rt)
+        .into_array_iter(&opened.rt)
         .map_err(|e| {
             ErrorCode::BadBytes(format!(
                 "FUSE storage_format='vortex' failed to build scan iterator: {e}"
@@ -231,6 +245,16 @@ fn decode_vortex_file_to_record_batch(
         })?;
 
     record_batch_from_vortex_root(array_ref)
+}
+
+fn decode_vortex_file_to_record_batch(
+    operator: opendal::Operator,
+    location: &str,
+    projection: Option<FieldNames>,
+    scan_filter: Option<Expression>,
+) -> Result<RecordBatch> {
+    let opened = open_vortex_file(operator, location)?;
+    scan_opened_vortex_file_to_record_batch(&opened, projection, scan_filter)
 }
 
 fn record_batch_from_vortex_root(array_ref: vortex::ArrayRef) -> Result<RecordBatch> {
