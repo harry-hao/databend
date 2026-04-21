@@ -43,9 +43,9 @@ use crate::fuse_part::FuseBlockPartInfo;
 use crate::io::BlockReader;
 use crate::io::DataItem;
 use crate::io::RowSelection;
-use crate::io::read::filter_vortex_record_batch_with_row_selection;
-use crate::io::read::open_vortex_file;
-use crate::io::read::scan_opened_vortex_file_to_record_batch;
+use crate::io::read::block::filter_vortex_record_batch_with_row_selection;
+use crate::io::read::block::open_vortex_file;
+use crate::io::read::block::scan_opened_vortex_file_to_record_batch;
 use crate::pruning::ExprBloomFilter;
 
 #[derive(Clone)]
@@ -235,6 +235,35 @@ impl ReadState {
         let pre_fields_empty = self.pre_reader.projected_schema.fields.is_empty();
         let remain_fields_empty = self.remain_reader.projected_schema.fields.is_empty();
 
+        // Match `deserialize_vortex_chunks_with_scan_filter`: when `result_rows == 0`, return
+        // empty blocks without opening or scanning the file (no prewhere/runtime filter pass).
+        if part.nums_rows == 0 {
+            let mut preread_block = if pre_fields_empty {
+                DataBlock::empty_with_rows(0)
+            } else {
+                DataBlock::empty_with_schema(&self.pre_reader.data_schema())
+            };
+            let remain_block = if remain_fields_empty {
+                DataBlock::empty_with_rows(0)
+            } else {
+                DataBlock::empty_with_schema(&self.remain_reader.data_schema())
+            };
+
+            let mut merged_fields = self.pre_reader.data_fields();
+            merged_fields.extend(self.remain_reader.data_fields());
+            let merged_schema = DataSchema::new(merged_fields);
+
+            preread_block.merge_block(remain_block);
+
+            let data_block = preread_block.resort(&merged_schema, &self.output_schema)?;
+
+            return Ok((data_block, None, None));
+        }
+
+        // `pre_reader` and `remain_reader` are both `BlockReader::change_projection` views of the
+        // same underlying reader; each stores `operator.clone()` from that source, so either
+        // operator denotes the same storage backend for `part.location` (we open once with
+        // `pre_reader.operator` even when only the remain side needs a scan).
         let opened_opt = if !pre_fields_empty || !remain_fields_empty {
             Some(open_vortex_file(
                 self.pre_reader.operator.clone(),

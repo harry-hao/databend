@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod agg_index;
-mod block;
+pub(crate) mod block;
 pub mod bloom;
 mod index_loader;
 mod inverted_index;
@@ -37,9 +37,6 @@ pub use block::RowSelection;
 pub use block::column_chunks_to_record_batch;
 pub use block::referenced_field_names;
 pub use block::translate_expr_to_vortex;
-pub(crate) use block::filter_vortex_record_batch_with_row_selection;
-pub(crate) use block::open_vortex_file;
-pub(crate) use block::scan_opened_vortex_file_to_record_batch;
 pub use bloom::BloomBlockFilterReader;
 pub use inverted_index::InvertedIndexReader;
 pub use meta::CompactSegmentInfoReader;
