@@ -43,6 +43,9 @@ use crate::fuse_part::FuseBlockPartInfo;
 use crate::io::BlockReader;
 use crate::io::DataItem;
 use crate::io::RowSelection;
+use crate::io::read::filter_vortex_record_batch_with_row_selection;
+use crate::io::read::open_vortex_file;
+use crate::io::read::scan_opened_vortex_file_to_record_batch;
 use crate::pruning::ExprBloomFilter;
 
 #[derive(Clone)]
@@ -229,13 +232,42 @@ impl ReadState {
         &self,
         part: &FuseBlockPartInfo,
     ) -> Result<(DataBlock, Option<RowSelection>, Option<Bitmap>)> {
-        let mut preread_block = self.pre_reader.deserialize_vortex_chunks(
-            &part.location,
-            part.nums_rows,
-            &part.columns_meta,
-            HashMap::new(),
-            None,
-        )?;
+        let pre_fields_empty = self.pre_reader.projected_schema.fields.is_empty();
+        let remain_fields_empty = self.remain_reader.projected_schema.fields.is_empty();
+
+        let opened_opt = if !pre_fields_empty || !remain_fields_empty {
+            Some(open_vortex_file(
+                self.pre_reader.operator.clone(),
+                &part.location,
+            )?)
+        } else {
+            None
+        };
+
+        let mut preread_block = if pre_fields_empty {
+            DataBlock::empty_with_rows(part.nums_rows)
+        } else {
+            let opened = opened_opt.as_ref().ok_or_else(|| {
+                ErrorCode::Internal(
+                    "Vortex ReadState: missing opened file for prewhere read".to_string(),
+                )
+            })?;
+            let projection = self.pre_reader.vortex_field_names_for_scan(None)?;
+            let record_batch = scan_opened_vortex_file_to_record_batch(
+                opened,
+                Some(projection),
+                None,
+            )?;
+            let result_rows = record_batch.num_rows();
+            if result_rows > part.nums_rows {
+                return Err(ErrorCode::BadBytes(format!(
+                    "FUSE storage_format='vortex' decoded rows {result_rows} exceeds metadata {}",
+                    part.nums_rows,
+                )));
+            }
+            self.pre_reader
+                .map_vortex_record_batch_to_data_block(&record_batch)?
+        };
 
         let filter_bitmap = self.filter(&preread_block, part.nums_rows)?;
         let runtime_filter_bitmap = self.runtime_filter(&preread_block, part.nums_rows)?;
@@ -266,13 +298,38 @@ impl ReadState {
 
         let row_selection = bitmap_selection.as_ref().map(RowSelection::from);
 
-        let remain_block = self.remain_reader.deserialize_vortex_chunks(
-            &part.location,
-            part.nums_rows,
-            &part.columns_meta,
-            HashMap::new(),
-            row_selection.as_ref(),
-        )?;
+        let remain_block = if remain_fields_empty {
+            let result_rows = row_selection
+                .as_ref()
+                .map(|s| s.selected_rows)
+                .unwrap_or(part.nums_rows);
+            DataBlock::empty_with_rows(result_rows)
+        } else {
+            let opened = opened_opt.as_ref().ok_or_else(|| {
+                ErrorCode::Internal(
+                    "Vortex ReadState: missing opened file for remain columns".to_string(),
+                )
+            })?;
+            let projection = self.remain_reader.vortex_field_names_for_scan(None)?;
+            let mut record_batch = scan_opened_vortex_file_to_record_batch(
+                opened,
+                Some(projection),
+                None,
+            )?;
+            let result_rows = record_batch.num_rows();
+            if result_rows > part.nums_rows {
+                return Err(ErrorCode::BadBytes(format!(
+                    "FUSE storage_format='vortex' decoded rows {result_rows} exceeds metadata {}",
+                    part.nums_rows,
+                )));
+            }
+            if let Some(sel) = row_selection.as_ref() {
+                record_batch =
+                    filter_vortex_record_batch_with_row_selection(record_batch, sel)?;
+            }
+            self.remain_reader
+                .map_vortex_record_batch_to_data_block(&record_batch)?
+        };
 
         let mut merged_fields = self.pre_reader.data_fields();
         merged_fields.extend(self.remain_reader.data_fields());

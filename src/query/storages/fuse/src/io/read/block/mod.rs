@@ -34,3 +34,6 @@ pub use parquet::RowSelection;
 pub use parquet::column_chunks_to_record_batch;
 pub use vortex_predicate::translate_expr_to_vortex;
 pub use vortex_predicate::referenced_field_names;
+pub(crate) use vortex_deserialize::filter_vortex_record_batch_with_row_selection;
+pub(crate) use vortex_deserialize::open_vortex_file;
+pub(crate) use vortex_deserialize::scan_opened_vortex_file_to_record_batch;
