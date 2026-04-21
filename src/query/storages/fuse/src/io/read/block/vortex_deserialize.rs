@@ -177,11 +177,11 @@ impl BlockReader {
 
 /// Holds a single opened Vortex block file together with the runtime and session used to open it,
 /// so scan/decode can be performed (once or multiple times) without reopening the underlying file.
+/// Fields are ordered so `file` drops before `_session` and `rt` (declaration-order drop).
 struct OpenedVortexFile {
-    rt: SingleThreadRuntime,
-    #[allow(dead_code)]
-    session: VortexSession,
     file: VortexFile,
+    _session: VortexSession,
+    rt: SingleThreadRuntime,
 }
 
 fn open_vortex_file(operator: opendal::Operator, location: &str) -> Result<OpenedVortexFile> {
@@ -206,7 +206,11 @@ fn open_vortex_file(operator: opendal::Operator, location: &str) -> Result<Opene
                 })
         })?;
 
-    Ok(OpenedVortexFile { rt, session, file })
+    Ok(OpenedVortexFile {
+        file,
+        _session: session,
+        rt,
+    })
 }
 
 fn scan_opened_vortex_file_to_record_batch(
