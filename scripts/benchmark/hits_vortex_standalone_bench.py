@@ -20,8 +20,168 @@ DEFAULT_DATABEND_DIR_ENV = "DATABEND_DIR"
 META_PORT = 9191
 QUERY_PORT = 8000
 
-META_TOML_TEMPLATE = "scripts/ci/deploy/config/databend-meta-node-1.toml"
-QUERY_TOML_TEMPLATE = "scripts/ci/deploy/config/databend-query-node-1.toml"
+META_TOML_TEXT = """# Usage:
+# databend-meta -c databend-meta-node-1.toml
+
+admin_api_address       = "0.0.0.0:28101"
+grpc_api_address        = "0.0.0.0:9191"
+# databend-query fetch this address to update its databend-meta endpoints list,
+# in case databend-meta cluster changes.
+grpc_api_advertise_host = "127.0.0.1"
+
+[log]
+[log.stderr]
+  on = false
+[log.file]
+  on = true
+  level = "INFO"
+  format = "json"
+  dir = "./artifacts/logs/meta"
+
+[raft_config]
+id            = 1
+raft_dir      = "./databend-data/meta1"
+raft_api_port = 28103
+
+# Assign raft_{listen|advertise}_host in test config.
+# This allows you to catch a bug in unit tests when something goes wrong in raft meta nodes communication.
+raft_listen_host = "127.0.0.1"
+raft_advertise_host = "localhost"
+
+# Start up mode: single node cluster
+single        = true
+"""
+
+QUERY_TOML_TEXT = """# Usage:
+# databend-query -c databend_query_config_spec.toml
+
+[query]
+max_active_sessions = 256
+shutdown_wait_timeout_ms = 5000
+
+# For flight rpc.
+flight_api_address = "0.0.0.0:9091"
+
+# Databend Query http address.
+# For admin RESET API.
+admin_api_address = "0.0.0.0:8080"
+
+# Databend Query metrics RESET API.
+metric_api_address = "0.0.0.0:7070"
+
+# Databend Query MySQL Handler.
+mysql_handler_host = "0.0.0.0"
+mysql_handler_port = 3307
+
+# Databend Query ClickHouse Handler.
+clickhouse_http_handler_host = "0.0.0.0"
+clickhouse_http_handler_port = 8124
+
+# Databend Query HTTP Handler.
+http_handler_host = "0.0.0.0"
+http_handler_port = 8000
+# mainly for test/debug
+# http_session_timeout_secs = 90
+http_handler_result_timeout_secs = 60
+
+# Databend Query FlightSQL Handler.
+flight_sql_handler_host = "0.0.0.0"
+flight_sql_handler_port = 8900
+
+tenant_id = "test_tenant"
+cluster_id = "test_cluster"
+warehouse_id = "test_warehouse"
+
+table_engine_memory_enabled = true
+default_storage_format = 'parquet'
+default_compression = 'zstd'
+
+enable_udf_server = true
+udf_server_allow_list = ['http://0.0.0.0:8815']
+udf_server_allow_insecure = true
+
+cloud_control_grpc_server_address = "http://0.0.0.0:50051"
+
+# network_policy_whitelist = ['127.0.0.0/8']
+
+[[query.users]]
+name = "root"
+auth_type = "no_password"
+
+[[query.users]]
+name = "default"
+auth_type = "no_password"
+
+# This for test
+[[query.udfs]]
+name = "ping"
+definition = "CREATE FUNCTION ping(STRING) RETURNS STRING LANGUAGE python HANDLER = 'ping' ADDRESS = 'http://0.0.0.0:8815'"
+
+[query.settings]
+aggregate_spilling_memory_ratio = 60
+join_spilling_memory_ratio = 60
+
+[log]
+
+[log.file]
+level = "DEBUG"
+format = "text"
+dir = "./artifacts/logs/query"
+limit = 12 # 12 files, 1 file per hour
+
+[log.query]
+on = true
+
+[log.profile]
+on = true
+
+[log.structlog]
+on = true
+dir = "./artifacts/logs/structlog"
+
+[meta]
+# It is a list of `grpc_api_advertise_host:<grpc-api-port>` of databend-meta config
+endpoints = ["0.0.0.0:9191"]
+username = "root"
+password = "root"
+client_timeout_in_second = 60
+auto_sync_interval = 60
+
+# Storage config.
+[storage]
+# fs | s3 | azblob | obs | oss
+type = "fs"
+allow_insecure = true
+
+# Limit OpenDAL concurrent IO requests to avoid EMFILE.
+storage_max_concurrent_io_requests = 128
+
+# Set a local folder to store your data.
+# Comment out this block if you're NOT using local file system as storage.
+[storage.fs]
+data_path = "./databend-data/query_storage"
+
+# Cache config.
+[cache]
+# Type of storage to keep the table data cache
+#
+# available options: [none|disk]
+# default is "none", which disable table data cache
+# use "disk" to enabled disk cache
+data_cache_storage = "none"
+
+[cache.disk]
+# cache path
+path = "./.databend/_cache"
+# max bytes of cached data 20G
+max_bytes = 21474836480
+
+[spill]
+spill_local_disk_path = "./.databend/temp/_query_spill"
+# Cap local spill to 5GB so window spills keep ~1GB quota with default 20% ratio.
+spill_local_disk_max_bytes = 1073741824
+window_partition_spilling_disk_quota_ratio = 20
+"""
 
 QUERIES_DIR = "benchmark/hits/queries"
 
@@ -48,30 +208,30 @@ def ensure_dir(path: str) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
+def clean_previous_run_data(run_dir: str) -> None:
+    """
+    Remove data produced by previous runs under the current run_dir.
+    This keeps the benchmark repeatable and avoids mixing artifacts across runs.
+    """
+    # Stop any leftover services that may still hold files open.
+    stop_services_best_effort()
+
+    for rel in ("artifacts"):
+        p = Path(run_dir) / rel
+        if p.exists():
+            shutil.rmtree(p, ignore_errors=True)
+
+
 def materialize_standalone_configs(databend_dir: str, run_dir: str) -> Tuple[str, str]:
     cfg_dir = Path(run_dir) / "artifacts" / "config"
     ensure_dir(str(cfg_dir))
 
-    meta_src = Path(databend_dir) / META_TOML_TEMPLATE
-    query_src = Path(databend_dir) / QUERY_TOML_TEMPLATE
-
     meta_dst = cfg_dir / "databend-meta-node-1.toml"
     query_dst = cfg_dir / "databend-query-node-1.toml"
 
-    shutil.copyfile(meta_src, meta_dst)
-    shutil.copyfile(query_src, query_dst)
-
-    # Minimal, conservative rewrites to keep all state inside run_dir.
-    meta_txt = meta_dst.read_text(encoding="utf-8")
-    meta_txt = meta_txt.replace('dir = "./.databend/logs1"', 'dir = "./artifacts/logs/meta"')
-    meta_txt = meta_txt.replace('raft_dir      = "./.databend/meta1"', 'raft_dir      = "./databend-data/meta1"')
-    meta_dst.write_text(meta_txt, encoding="utf-8")
-
-    query_txt = query_dst.read_text(encoding="utf-8")
-    query_txt = query_txt.replace('dir = "./.databend/logs_1"', 'dir = "./artifacts/logs/query"')
-    query_txt = query_txt.replace('dir = "./.databend/structlog_1"', 'dir = "./artifacts/logs/structlog"')
-    query_txt = query_txt.replace('data_path = "./.databend/stateless_test_data"', 'data_path = "./databend-data/query_storage"')
-    query_dst.write_text(query_txt, encoding="utf-8")
+    # Materialize configs from embedded templates so the benchmark is self-contained.
+    meta_dst.write_text(META_TOML_TEXT, encoding="utf-8")
+    query_dst.write_text(QUERY_TOML_TEXT, encoding="utf-8")
 
     return str(meta_dst), str(query_dst)
 
@@ -732,6 +892,8 @@ def main() -> int:
     sys.stderr.write(f"Running in: {run_dir}\n")
     sys.stderr.write(f"Using DATABEND_DIR: {databend_dir}\n")
     sys.stderr.write(f"Queries: {len(query_files)}\n")
+
+    clean_previous_run_data(run_dir)
 
     ensure_dir(str(Path(run_dir) / "artifacts" / "results"))
     ensure_dir(str(Path(run_dir) / "databend-data"))
