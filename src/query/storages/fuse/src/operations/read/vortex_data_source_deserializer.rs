@@ -231,6 +231,7 @@ impl Processor for VortexDeserializeDataTransform {
                                             None,
                                             Some(vortex_filter),
                                             extra,
+                                            None,
                                         )?
                                     }
                                     None => {
