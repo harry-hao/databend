@@ -34,14 +34,16 @@ use vortex::dtype::FieldNames;
 use vortex::expr::Expression;
 use vortex::expr::root;
 use vortex::expr::select;
-use vortex::iter::ArrayIteratorExt;
+use vortex::iter::ArrayIterator;
 use vortex::buffer::Buffer;
+use vortex::arrays::ChunkedArray;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::VortexFile;
 use vortex::io::runtime::single::SingleThreadRuntime;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
+use vortex::IntoArray;
 use vortex::VortexSessionDefault;
 
 use super::parquet::RowSelection;
@@ -238,7 +240,7 @@ pub(crate) fn open_vortex_file(
                     "FUSE storage_format='vortex' failed to build read_at for {location}: {e}"
                 ))
             })?;
-            session_for_open
+            let file = session_for_open
                 .open_options()
                 .open_read_at(read_at)
                 .await
@@ -248,6 +250,8 @@ pub(crate) fn open_vortex_file(
                     ))
                 })
                 .map_err(|e| e)
+                ?;
+            Ok::<_, ErrorCode>(file)
         })?;
 
     Ok(OpenedVortexFile {
@@ -285,21 +289,50 @@ pub(crate) fn scan_opened_vortex_file_to_record_batch(
         None => scan,
     };
 
-    let array_ref = scan
-        .into_array_iter(&opened.rt)
-        .map_err(|e| {
-            ErrorCode::BadBytes(format!(
-                "FUSE storage_format='vortex' failed to build scan iterator: {e}"
-            ))
-        })?
-        .read_all()
-        .map_err(|e| {
+    let mut array_iter = scan.into_array_iter(&opened.rt).map_err(|e| {
         ErrorCode::BadBytes(format!(
-            "FUSE storage_format='vortex' failed to read arrays: {e}"
+            "FUSE storage_format='vortex' failed to build scan iterator: {e}"
         ))
     })?;
 
-    record_batch_from_vortex_root(array_ref)
+    let iter_dtype = array_iter.dtype().clone();
+    let mut chunks = Vec::new();
+    let mut chunk_idx = 0usize;
+    loop {
+        let next_item = array_iter.next();
+
+        match next_item {
+            None => break,
+            Some(item) => {
+                let chunk = item.map_err(|e| {
+                    ErrorCode::BadBytes(format!(
+                        "FUSE storage_format='vortex' failed to read chunk {}: {e}",
+                        chunk_idx
+                    ))
+                })?;
+                chunks.push(chunk);
+                chunk_idx += 1;
+            }
+        }
+    }
+
+    let array_ref = if chunks.len() == 1 {
+        chunks
+            .pop()
+            .ok_or_else(|| ErrorCode::BadBytes("FUSE storage_format='vortex' empty chunk stream".to_string()))?
+    } else {
+        ChunkedArray::try_new(chunks, iter_dtype)
+            .map_err(|e| {
+                ErrorCode::BadBytes(format!(
+                    "FUSE storage_format='vortex' failed to assemble streamed chunks: {e}"
+                ))
+            })?
+            .into_array()
+    };
+
+    let rb = record_batch_from_vortex_root(array_ref)?;
+
+    Ok(rb)
 }
 
 fn decode_vortex_file_to_record_batch(
@@ -310,7 +343,13 @@ fn decode_vortex_file_to_record_batch(
     row_indices: Option<&[u32]>,
 ) -> Result<RecordBatch> {
     let opened = open_vortex_file(operator, location)?;
-    scan_opened_vortex_file_to_record_batch(&opened, "single", projection, scan_filter, row_indices)
+    scan_opened_vortex_file_to_record_batch(
+        &opened,
+        "single",
+        projection,
+        scan_filter,
+        row_indices,
+    )
 }
 
 fn record_batch_from_vortex_root(array_ref: vortex::ArrayRef) -> Result<RecordBatch> {

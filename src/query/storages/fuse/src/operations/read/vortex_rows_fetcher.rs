@@ -39,6 +39,7 @@ use crate::FuseTable;
 use crate::io::BlockReader;
 use crate::io::CompactSegmentInfoReader;
 use crate::io::MetaReaders;
+use databend_common_base::runtime::spawn_blocking;
 
 /// A Vortex-specific implementation of RowFetch.
 ///
@@ -275,17 +276,27 @@ impl VortexRowsFetcher {
             // ScanBuilder requires sorted indices.
             uniq_indices.sort_unstable();
             uniq_indices.dedup();
+            let location = metadata.location.clone();
 
-            let block = reader.deserialize_vortex_chunks_with_scan_filter(
-                &metadata.location,
-                metadata.nums_rows,
-                &metadata.columns_meta,
-                std::collections::HashMap::new(),
-                None,
-                None,
-                None,
-                Some(uniq_indices.as_slice()),
-            )?;
+            let block = spawn_blocking(move || {
+                reader.deserialize_vortex_chunks_with_scan_filter(
+                    &metadata.location,
+                    metadata.nums_rows,
+                    &metadata.columns_meta,
+                    std::collections::HashMap::new(),
+                    None,
+                    None,
+                    None,
+                    Some(uniq_indices.as_slice()),
+                )
+            })
+            .await
+            .map_err(|e| {
+                ErrorCode::Internal(format!(
+                    "Vortex row fetch blocking task join failed for {}: {e}",
+                    location
+                ))
+            })??;
             Ok((final_index, block))
         }
     }
