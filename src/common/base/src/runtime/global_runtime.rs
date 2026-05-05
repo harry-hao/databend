@@ -23,8 +23,16 @@ use crate::runtime::Runtime;
 pub struct GlobalIORuntime;
 
 pub struct GlobalQueryRuntime(pub Runtime);
+pub struct GlobalVortexRuntime(pub Runtime);
 
 impl GlobalQueryRuntime {
+    #[inline(always)]
+    pub fn runtime(self: &Arc<Self>) -> &Runtime {
+        &self.0
+    }
+}
+
+impl GlobalVortexRuntime {
     #[inline(always)]
     pub fn runtime(self: &Arc<Self>) -> &Runtime {
         &self.0
@@ -54,20 +62,34 @@ impl GlobalIORuntime {
 
 impl GlobalQueryRuntime {
     pub fn init(num_cpus: usize) -> Result<()> {
-        static INIT: OnceLock<Result<()>> = OnceLock::new();
-        INIT.get_or_init(|| {
-            let thread_num = std::cmp::max(num_cpus, num_cpus::get() / 2);
-            let thread_num = std::cmp::max(2, thread_num);
+        let thread_num = std::cmp::max(num_cpus, num_cpus::get() / 2);
+        let thread_num = std::cmp::max(2, thread_num);
 
-            let rt =
-                Runtime::with_worker_threads(thread_num, Some("g-query-worker".to_owned()))?;
-            GlobalInstance::set(Arc::new(GlobalQueryRuntime(rt)));
-            Ok(())
-        })
-        .clone()
+        let rt = Runtime::with_worker_threads(thread_num, Some("g-query-worker".to_owned()))?;
+        GlobalInstance::set(Arc::new(GlobalQueryRuntime(rt)));
+        Ok(())
     }
 
     pub fn instance() -> Arc<GlobalQueryRuntime> {
         GlobalInstance::get()
     }
 }
+
+impl GlobalVortexRuntime {
+    pub fn init(num_cpus: usize) -> Result<()> {
+        let thread_num = std::cmp::max(num_cpus, num_cpus::get() / 2);
+        let thread_num = std::cmp::max(2, thread_num);
+        let rt = Runtime::with_worker_threads(thread_num, Some("vortex-worker".to_owned()))?;
+        GlobalInstance::set(Arc::new(GlobalVortexRuntime(rt)));
+        Ok(())
+    }
+
+    pub fn instance() -> Arc<GlobalVortexRuntime> {
+        GlobalInstance::get()
+    }
+
+    pub fn try_instance() -> Option<Arc<GlobalVortexRuntime>> {
+        GlobalInstance::try_get()
+    }
+}
+

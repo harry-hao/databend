@@ -117,12 +117,14 @@ pub fn row_fetch_processor(
 
             Ok(Box::new(move |input, output| {
                 let fetcher: AnyRowsFetcher = match &fuse_table.storage_format {
-                    FuseStorageFormat::Parquet => AnyRowsFetcher::Parquet(ParquetRowsFetcher::create(
-                        fuse_table.clone(),
-                        projection.clone(),
-                        block_reader.clone(),
-                        read_settings,
-                    )),
+                    FuseStorageFormat::Parquet => {
+                        AnyRowsFetcher::Parquet(ParquetRowsFetcher::create(
+                            fuse_table.clone(),
+                            projection.clone(),
+                            block_reader.clone(),
+                            read_settings,
+                        ))
+                    }
                     FuseStorageFormat::Vortex => AnyRowsFetcher::Vortex(VortexRowsFetcher::create(
                         fuse_table.clone(),
                         block_reader.clone(),

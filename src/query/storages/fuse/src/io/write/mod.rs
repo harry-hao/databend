@@ -14,7 +14,6 @@
 
 mod block_statistics_writer;
 mod block_writer;
-mod vortex_encode;
 mod bloom_index_writer;
 mod inverted_index_writer;
 mod meta_writer;
@@ -22,6 +21,7 @@ mod spatial_index_writer;
 mod stream;
 mod vector_index_writer;
 mod virtual_column_builder;
+mod vortex_encode;
 mod write_settings;
 
 pub use block_statistics_writer::BlockStatsBuilder;

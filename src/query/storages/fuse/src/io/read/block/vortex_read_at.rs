@@ -14,6 +14,10 @@
 
 use std::io;
 
+use databend_common_base::runtime::profile::Profile;
+use databend_common_base::runtime::profile::ProfileStatisticsName;
+use databend_common_metrics::storage::metrics_inc_remote_io_read_bytes;
+use databend_common_metrics::storage::metrics_inc_remote_io_seeks;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use opendal::Operator;
@@ -53,6 +57,7 @@ impl OpendalReadAt {
             reader,
             size: meta.content_length(),
             performance_hint: PerformanceHint::object_storage(),
+            // performance_hint: PerformanceHint::local(),
         })
     }
 }
@@ -104,9 +109,18 @@ impl VortexReadAt for OpendalReadAt {
                 .into());
             }
 
+            let len = bytes.len();
+            if len > 0 {
+                Profile::record_usize_profile(
+                    ProfileStatisticsName::ScanBytesFromRemote,
+                    len,
+                );
+                metrics_inc_remote_io_read_bytes(len as u64);
+                metrics_inc_remote_io_seeks(1);
+            }
+
             Ok(ByteBuffer::from(bytes.to_vec()).aligned(alignment))
         }
         .boxed()
     }
 }
-

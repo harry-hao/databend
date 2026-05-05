@@ -30,8 +30,8 @@ use databend_common_functions::BUILTIN_FUNCTIONS;
 use databend_storages_common_table_meta::table::TableCompression;
 use opendal::Operator;
 
-use crate::io::BlockReadContext;
 use crate::FuseStorageFormat;
+use crate::io::BlockReadContext;
 use crate::io::BlockReader;
 
 #[derive(Clone)]

@@ -38,7 +38,10 @@ impl FuseVortexBlockFormat {
     /// Legacy helper for the `open_buffer` fallback: merge-IO must fetch a contiguous prefix that
     /// covers the Vortex footer; use the on-disk block size from segment metadata when available.
     #[allow(dead_code)]
-    fn resolve_read_size(block_file_size: u64, columns_meta: &HashMap<ColumnId, ColumnMeta>) -> u64 {
+    fn resolve_read_size(
+        block_file_size: u64,
+        columns_meta: &HashMap<ColumnId, ColumnMeta>,
+    ) -> u64 {
         if block_file_size > 0 {
             return block_file_size;
         }
@@ -64,11 +67,9 @@ impl FuseVortexBlockFormat {
             .iter()
             .map(|(id, meta)| {
                 let patched = match meta {
-                    ColumnMeta::Vortex(s) => ColumnMeta::Vortex(SingleColumnMeta::new(
-                        0,
-                        size,
-                        s.num_values,
-                    )),
+                    ColumnMeta::Vortex(s) => {
+                        ColumnMeta::Vortex(SingleColumnMeta::new(0, size, s.num_values))
+                    }
                     _ => meta.clone(),
                 };
                 (*id, patched)
@@ -113,7 +114,11 @@ impl FuseBlockFormat for FuseVortexBlockFormat {
         Ok(RawDataSource::Vortex(source))
     }
 
-    async fn read_block_meta(&self, _operator: &Operator, _location: &str) -> Option<ReadBlockMeta> {
+    async fn read_block_meta(
+        &self,
+        _operator: &Operator,
+        _location: &str,
+    ) -> Option<ReadBlockMeta> {
         None
     }
 }

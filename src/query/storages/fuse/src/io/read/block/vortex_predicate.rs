@@ -18,6 +18,9 @@ use databend_common_expression::Expr;
 use databend_common_expression::Scalar;
 use databend_common_expression::types::DataType;
 use databend_common_expression::types::NumberScalar;
+use vortex::dtype::DType;
+use vortex::dtype::Nullability;
+use vortex::dtype::PType;
 use vortex::expr::Expression;
 use vortex::expr::and;
 use vortex::expr::col;
@@ -30,9 +33,6 @@ use vortex::expr::lt;
 use vortex::expr::lt_eq;
 use vortex::expr::not;
 use vortex::expr::not_eq;
-use vortex::dtype::DType;
-use vortex::dtype::Nullability;
-use vortex::dtype::PType;
 use vortex::scalar::Scalar as VortexScalar;
 
 /// Translate a Databend scalar `Expr` into a Vortex [`Expression`] for filter pushdown.
@@ -46,7 +46,10 @@ pub fn translate_expr_to_vortex(expr: &Expr, schema: &DataSchema) -> Result<Opti
     Ok(translate_expr_to_vortex_inner(expr, schema))
 }
 
-pub fn referenced_field_names(expr: &Expr, schema: &DataSchema) -> Option<vortex::dtype::FieldNames> {
+pub fn referenced_field_names(
+    expr: &Expr,
+    schema: &DataSchema,
+) -> Option<vortex::dtype::FieldNames> {
     use std::collections::BTreeSet;
     let mut set = BTreeSet::<String>::new();
     collect_referenced_field_names(expr, schema, &mut set)?;
@@ -274,30 +277,16 @@ mod tests {
 
     fn schema_ab_i64() -> DataSchema {
         DataSchema::new(vec![
-            DataField::new(
-                "a",
-                DataType::Number(NumberDataType::Int64),
-            ),
-            DataField::new(
-                "b",
-                DataType::Number(NumberDataType::Int64),
-            ),
+            DataField::new("a", DataType::Number(NumberDataType::Int64)),
+            DataField::new("b", DataType::Number(NumberDataType::Int64)),
         ])
     }
 
     #[test]
     fn supported_and_eq_is_not_null_translate_some() {
         let schema = schema_ab_i64();
-        let a = col_ref(
-            0,
-            "a",
-            DataType::Number(NumberDataType::Int64),
-        );
-        let b = col_ref(
-            1,
-            "b",
-            DataType::Number(NumberDataType::Int64),
-        );
+        let a = col_ref(0, "a", DataType::Number(NumberDataType::Int64));
+        let b = col_ref(1, "b", DataType::Number(NumberDataType::Int64));
 
         let eq_a_1 = check_function(None, "eq", &[], &[a, lit_i64(1)], &BUILTIN_FUNCTIONS).unwrap();
         let b_not_null =
@@ -322,20 +311,18 @@ mod tests {
     #[test]
     fn unsupported_or_translates_none() {
         let schema = schema_ab_i64();
-        let a = col_ref(
-            0,
-            "a",
-            DataType::Number(NumberDataType::Int64),
-        );
-        let b = col_ref(
-            1,
-            "b",
-            DataType::Number(NumberDataType::Int64),
-        );
+        let a = col_ref(0, "a", DataType::Number(NumberDataType::Int64));
+        let b = col_ref(1, "b", DataType::Number(NumberDataType::Int64));
         let a_eq_1 = check_function(None, "eq", &[], &[a, lit_i64(1)], &BUILTIN_FUNCTIONS).unwrap();
         let b_eq_2 = check_function(None, "eq", &[], &[b, lit_i64(2)], &BUILTIN_FUNCTIONS).unwrap();
-        let expr =
-            check_function(None, "or_filters", &[], &[a_eq_1, b_eq_2], &BUILTIN_FUNCTIONS).unwrap();
+        let expr = check_function(
+            None,
+            "or_filters",
+            &[],
+            &[a_eq_1, b_eq_2],
+            &BUILTIN_FUNCTIONS,
+        )
+        .unwrap();
 
         let translated = translate_expr_to_vortex(&expr, &schema).unwrap();
         assert!(translated.is_none());
@@ -344,13 +331,10 @@ mod tests {
     #[test]
     fn unsupported_like_translates_none() {
         // use a string-typed column
-        let schema = DataSchema::new(vec![DataField::new(
-            "s",
-            DataType::String,
-        )]);
+        let schema = DataSchema::new(vec![DataField::new("s", DataType::String)]);
         let s = col_ref(0, "s", DataType::String);
-        let expr = check_function(None, "like", &[], &[s, lit_str("%x%")], &BUILTIN_FUNCTIONS)
-            .unwrap();
+        let expr =
+            check_function(None, "like", &[], &[s, lit_str("%x%")], &BUILTIN_FUNCTIONS).unwrap();
 
         let translated = translate_expr_to_vortex(&expr, &schema).unwrap();
         assert!(translated.is_none());
@@ -359,22 +343,11 @@ mod tests {
     #[test]
     fn nested_column_ref_translates_none() {
         let schema = schema_ab_i64();
-        let a_nested = col_ref(
-            0,
-            "a.b",
-            DataType::Number(NumberDataType::Int64),
-        );
-        let expr = check_function(
-            None,
-            "eq",
-            &[],
-            &[a_nested, lit_i64(1)],
-            &BUILTIN_FUNCTIONS,
-        )
-        .unwrap();
+        let a_nested = col_ref(0, "a.b", DataType::Number(NumberDataType::Int64));
+        let expr =
+            check_function(None, "eq", &[], &[a_nested, lit_i64(1)], &BUILTIN_FUNCTIONS).unwrap();
 
         let translated = translate_expr_to_vortex(&expr, &schema).unwrap();
         assert!(translated.is_none());
     }
 }
-

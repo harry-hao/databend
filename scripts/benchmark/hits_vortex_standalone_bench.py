@@ -3,6 +3,7 @@
 #
 
 import os
+import argparse
 import csv
 import json
 import re
@@ -202,7 +203,7 @@ FAIL_ON_ANY_QUERY_ERROR = False
 
 # Run order: user preference is to run vortex first.
 RUN_VORTEX_FIRST = True
-
+DEFAULT_START_QUERY_INDEX = 0
 
 def ensure_dir(path: str) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
@@ -220,6 +221,31 @@ def clean_previous_run_data(run_dir: str) -> None:
         p = Path(run_dir) / rel
         if p.exists():
             shutil.rmtree(p, ignore_errors=True)
+
+
+def backup_previous_results(run_dir: str) -> None:
+    results_dir = Path(run_dir) / "artifacts" / "results"
+    if not results_dir.exists():
+        return
+
+    has_files = any(p.is_file() for p in results_dir.rglob("*"))
+    if not has_files:
+        return
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    backup_dir = Path(run_dir) / "artifacts_backup" / ts / "results"
+    ensure_dir(str(backup_dir.parent))
+    shutil.copytree(results_dir, backup_dir)
+
+
+def reset_results_files(run_dir: str) -> None:
+    """Remove previous result files so current run always starts from a clean slate."""
+    results_dir = Path(run_dir) / "artifacts" / "results"
+    ensure_dir(str(results_dir))
+    for name in ("timings.csv", "errors.jsonl", "correctness.csv", "report.md"):
+        p = results_dir / name
+        if p.exists():
+            p.unlink()
 
 
 def materialize_standalone_configs(databend_dir: str, run_dir: str) -> Tuple[str, str]:
@@ -244,12 +270,20 @@ def discover_query_dir(dir_path: str) -> List[str]:
     return sorted(str(p) for p in Path(dir_path).glob("*.sql"))
 
 
-def resolve_query_files(databend_dir: str) -> List[str]:
+def query_index_from_file(path: str) -> int:
+    stem = Path(path).stem
+    if not stem.isdigit():
+        raise RuntimeError(f"Unexpected query filename (expected numeric stem): {path}")
+    return int(stem)
+
+
+def resolve_query_files(databend_dir: str, start_query_index: int) -> List[str]:
     qdir = Path(databend_dir) / QUERIES_DIR
     if not qdir.exists():
         raise RuntimeError(f"Queries dir not found: {qdir}")
     if not RUN_QUERIES:
-        return discover_query_dir(str(qdir))
+        discovered = discover_query_dir(str(qdir))
+        return [p for p in discovered if query_index_from_file(p) >= start_query_index]
     files: List[str] = []
     for stem in RUN_QUERIES:
         p = qdir / f"{stem}.sql"
@@ -627,6 +661,21 @@ def count_table_sql(table: str) -> str:
     return f"SELECT count(*) AS c FROM {table};"
 
 
+def ensure_table_exists(bendsql_bin: str, table: str) -> None:
+    code, out, err, _ = run_sql_in_db(
+        bendsql_bin,
+        f"SELECT 1 FROM {table} LIMIT 1;",
+        output="null",
+    )
+    if code != 0:
+        raise RuntimeError(
+            f"Table `{table}` does not exist or is unreadable. "
+            f"Run with --load to (re)create/load benchmark tables.\n"
+            f"stdout:\n{out}\n"
+            f"stderr:\n{err}\n"
+        )
+
+
 def load_hits_table(
     bendsql_bin: str,
     table: str,
@@ -789,6 +838,57 @@ def fingerprint_sql(sql: str, table: str) -> str:
     )
 
 
+def correctness_diff_count_sql(sql: str) -> str:
+    base_q = substitute_hits_table(sql, TABLE_BASELINE).rstrip().rstrip(";")
+    vortex_q = substitute_hits_table(sql, TABLE_VORTEX).rstrip().rstrip(";")
+    return (
+        "WITH\n"
+        "q_base AS (\n"
+        f"{base_q}\n"
+        "),\n"
+        "q_vortex AS (\n"
+        f"{vortex_q}\n"
+        "),\n"
+        "diff AS (\n"
+        "  (SELECT * FROM q_base EXCEPT ALL SELECT * FROM q_vortex)\n"
+        "  UNION ALL\n"
+        "  (SELECT * FROM q_vortex EXCEPT ALL SELECT * FROM q_base)\n"
+        ")\n"
+        "SELECT count(*) AS diff_count FROM diff"
+    )
+
+
+def correctness_diff_count(
+    bendsql_bin: str,
+    query_name: str,
+    sql: str,
+    run_dir: str,
+    host: str = "127.0.0.1",
+    port: int = QUERY_PORT,
+) -> Tuple[bool, int, str]:
+    check_sql = correctness_diff_count_sql(sql)
+    code, out, err, _ = run_sql_in_db(bendsql_bin, check_sql, host=host, port=port, output="tsv")
+    if code != 0:
+        with open_errors_jsonl(run_dir) as errfp:
+            append_error_jsonl(
+                errfp,
+                {
+                    "kind": "correctness_error",
+                    "query": query_name,
+                    "stderr": err[-4000:],
+                    "stdout": out[-4000:],
+                },
+            )
+        return False, -1, err[-1000:]
+
+    rows = parse_tsv_table(out)
+    if len(rows) < 2 or not rows[1] or not rows[1][0].strip():
+        return False, -1, f"unexpected correctness output: {out[-1000:]}"
+
+    diff_count = int(rows[1][0])
+    return diff_count == 0, diff_count, ""
+
+
 def fingerprint_query(
     bendsql_bin: str,
     query_name: str,
@@ -883,20 +983,39 @@ def write_report_md(run_dir: str, mismatches: List[str]) -> str:
     return str(p)
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Hits vortex vs parquet standalone benchmark")
+    parser.add_argument(
+        "--load",
+        action="store_true",
+        help="(Re)create and load benchmark tables before running queries. Default: skip loading.",
+    )
+    parser.add_argument(
+        "--start-query",
+        type=int,
+        default=DEFAULT_START_QUERY_INDEX,
+        help=f"Start query index for auto-discovery (default: {DEFAULT_START_QUERY_INDEX}, i.e. Q01).",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
+    args = parse_args()
     run_dir = os.getcwd()
     databend_dir = get_databend_dir()
     meta_bin, query_bin, bendsql_bin = resolve_release_bins(databend_dir)
 
-    query_files = resolve_query_files(databend_dir)
+    query_files = resolve_query_files(databend_dir, args.start_query)
     sys.stderr.write(f"Running in: {run_dir}\n")
     sys.stderr.write(f"Using DATABEND_DIR: {databend_dir}\n")
     sys.stderr.write(f"Queries: {len(query_files)}\n")
 
+    backup_previous_results(run_dir)
     clean_previous_run_data(run_dir)
 
     ensure_dir(str(Path(run_dir) / "artifacts" / "results"))
     ensure_dir(str(Path(run_dir) / "databend-data"))
+    reset_results_files(run_dir)
 
     meta_cfg, query_cfg = materialize_standalone_configs(databend_dir, run_dir)
 
@@ -907,8 +1026,12 @@ def main() -> int:
         sys.stderr.write("Creating database...\n")
         init_database(bendsql_bin)
         probe_vortex_support(bendsql_bin)
-        sys.stderr.write(f"Creating+loading {TABLE_VORTEX}...\n")
-        create_table_and_load(bendsql_bin, TABLE_VORTEX, storage_format="vortex", gz_path=HITS_TSV_GZ)
+        if args.load:
+            sys.stderr.write(f"Creating+loading {TABLE_VORTEX}...\n")
+            create_table_and_load(bendsql_bin, TABLE_VORTEX, storage_format="vortex", gz_path=HITS_TSV_GZ)
+        else:
+            sys.stderr.write(f"Skipping load; using existing {TABLE_VORTEX}.\n")
+            ensure_table_exists(bendsql_bin, TABLE_VORTEX)
         sys.stderr.write(f"Running queries on {TABLE_VORTEX}...\n")
         run_queries_for_table(bendsql_bin, query_files, TABLE_VORTEX, run_dir)
 
@@ -917,8 +1040,12 @@ def main() -> int:
             start_services(meta_bin, query_bin, meta_cfg, query_cfg, run_dir, cold_start=True)
             sys.stderr.write("Creating database...\n")
             init_database(bendsql_bin)
-        sys.stderr.write(f"Creating+loading {TABLE_BASELINE}...\n")
-        create_table_and_load(bendsql_bin, TABLE_BASELINE, storage_format="", gz_path=HITS_TSV_GZ)
+        if args.load:
+            sys.stderr.write(f"Creating+loading {TABLE_BASELINE}...\n")
+            create_table_and_load(bendsql_bin, TABLE_BASELINE, storage_format="", gz_path=HITS_TSV_GZ)
+        else:
+            sys.stderr.write(f"Skipping load; using existing {TABLE_BASELINE}.\n")
+            ensure_table_exists(bendsql_bin, TABLE_BASELINE)
         sys.stderr.write(f"Running queries on {TABLE_BASELINE}...\n")
         run_queries_for_table(bendsql_bin, query_files, TABLE_BASELINE, run_dir)
     else:
@@ -926,8 +1053,12 @@ def main() -> int:
         start_services(meta_bin, query_bin, meta_cfg, query_cfg, run_dir, cold_start=True)
         sys.stderr.write("Creating database...\n")
         init_database(bendsql_bin)
-        sys.stderr.write(f"Creating+loading {TABLE_BASELINE}...\n")
-        create_table_and_load(bendsql_bin, TABLE_BASELINE, storage_format="", gz_path=HITS_TSV_GZ)
+        if args.load:
+            sys.stderr.write(f"Creating+loading {TABLE_BASELINE}...\n")
+            create_table_and_load(bendsql_bin, TABLE_BASELINE, storage_format="", gz_path=HITS_TSV_GZ)
+        else:
+            sys.stderr.write(f"Skipping load; using existing {TABLE_BASELINE}.\n")
+            ensure_table_exists(bendsql_bin, TABLE_BASELINE)
         sys.stderr.write(f"Running queries on {TABLE_BASELINE}...\n")
         run_queries_for_table(bendsql_bin, query_files, TABLE_BASELINE, run_dir)
 
@@ -937,37 +1068,33 @@ def main() -> int:
             sys.stderr.write("Creating database...\n")
             init_database(bendsql_bin)
         probe_vortex_support(bendsql_bin)
-        sys.stderr.write(f"Creating+loading {TABLE_VORTEX}...\n")
-        create_table_and_load(bendsql_bin, TABLE_VORTEX, storage_format="vortex", gz_path=HITS_TSV_GZ)
+        if args.load:
+            sys.stderr.write(f"Creating+loading {TABLE_VORTEX}...\n")
+            create_table_and_load(bendsql_bin, TABLE_VORTEX, storage_format="vortex", gz_path=HITS_TSV_GZ)
+        else:
+            sys.stderr.write(f"Skipping load; using existing {TABLE_VORTEX}.\n")
+            ensure_table_exists(bendsql_bin, TABLE_VORTEX)
         sys.stderr.write(f"Running queries on {TABLE_VORTEX}...\n")
         run_queries_for_table(bendsql_bin, query_files, TABLE_VORTEX, run_dir)
 
-    # Correctness fingerprints: baseline vs vortex
-    sys.stderr.write("Computing correctness fingerprints...\n")
+    # Correctness check: exact multiset comparison via EXCEPT ALL (both directions).
+    sys.stderr.write("Computing correctness diffs...\n")
     correctness_rows: List[dict] = []
     mismatched: List[str] = []
     for qf in query_files:
         qname = query_short_name(qf)
         sql = load_sql_file(qf)
-        base_fp = fingerprint_query(bendsql_bin, qname, sql, TABLE_BASELINE, run_dir)
-        vortex_fp = fingerprint_query(bendsql_bin, qname, sql, TABLE_VORTEX, run_dir)
-        ok = compare_fingerprints(base_fp, vortex_fp) and base_fp["row_count"] != ""
+        ok, diff_count, err_msg = correctness_diff_count(
+            bendsql_bin, qname, sql, run_dir
+        )
         if not ok:
             mismatched.append(qname)
         correctness_rows.append(
             {
                 "query": qname,
                 "status": "PASS" if ok else "FAIL",
-                "baseline_row_count": base_fp["row_count"],
-                "vortex_row_count": vortex_fp["row_count"],
-                "baseline_h_sum": base_fp["h_sum"],
-                "vortex_h_sum": vortex_fp["h_sum"],
-                "baseline_h_sum2": base_fp["h_sum2"],
-                "vortex_h_sum2": vortex_fp["h_sum2"],
-                "baseline_h_min": base_fp["h_min"],
-                "vortex_h_min": vortex_fp["h_min"],
-                "baseline_h_max": base_fp["h_max"],
-                "vortex_h_max": vortex_fp["h_max"],
+                "diff_count": diff_count,
+                "error": err_msg,
             }
         )
 

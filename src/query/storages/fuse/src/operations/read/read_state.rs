@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use databend_common_base::runtime::GlobalIORuntime;
 use databend_common_base::runtime::profile::Profile;
 use databend_common_base::runtime::profile::ProfileStatisticsName;
 use databend_common_catalog::plan::PrewhereInfo;
@@ -44,7 +45,7 @@ use crate::io::BlockReader;
 use crate::io::DataItem;
 use crate::io::RowSelection;
 use crate::io::read::block::filter_vortex_record_batch_with_row_selection;
-use crate::io::read::block::open_vortex_file;
+use crate::io::read::block::open_vortex_file_async;
 use crate::io::read::block::scan_opened_vortex_file_to_record_batch;
 use crate::pruning::ExprBloomFilter;
 
@@ -232,6 +233,13 @@ impl ReadState {
         &self,
         part: &FuseBlockPartInfo,
     ) -> Result<(DataBlock, Option<RowSelection>, Option<Bitmap>)> {
+        GlobalIORuntime::instance().block_on(self.deserialize_and_filter_vortex_async(part))
+    }
+
+    pub async fn deserialize_and_filter_vortex_async(
+        &self,
+        part: &FuseBlockPartInfo,
+    ) -> Result<(DataBlock, Option<RowSelection>, Option<Bitmap>)> {
         let pre_fields_empty = self.pre_reader.projected_schema.fields.is_empty();
         let remain_fields_empty = self.remain_reader.projected_schema.fields.is_empty();
         let _ = (pre_fields_empty, remain_fields_empty);
@@ -276,10 +284,7 @@ impl ReadState {
             let row_selection = bitmap_selection.as_ref().map(RowSelection::from);
 
             let remain_block = if remain_fields_empty {
-                let result_rows = row_selection
-                    .as_ref()
-                    .map(|s| s.selected_rows)
-                    .unwrap_or(0);
+                let result_rows = row_selection.as_ref().map(|s| s.selected_rows).unwrap_or(0);
                 DataBlock::empty_with_rows(result_rows)
             } else {
                 DataBlock::empty_with_schema(&self.remain_reader.data_schema())
@@ -301,10 +306,7 @@ impl ReadState {
         // operator denotes the same storage backend for `part.location` (we open once with
         // `pre_reader.operator` even when only the remain side needs a scan).
         let opened_opt = if !pre_fields_empty || !remain_fields_empty {
-            Some(open_vortex_file(
-                self.pre_reader.operator.clone(),
-                &part.location,
-            )?)
+            Some(open_vortex_file_async(self.pre_reader.operator.clone(), &part.location).await?)
         } else {
             None
         };
@@ -324,7 +326,8 @@ impl ReadState {
                 Some(projection),
                 None,
                 None,
-            )?;
+            )
+            .await?;
             let result_rows = record_batch.num_rows();
             if result_rows > part.nums_rows {
                 return Err(ErrorCode::BadBytes(format!(
@@ -404,7 +407,8 @@ impl ReadState {
                 Some(projection),
                 None,
                 None,
-            )?;
+            )
+            .await?;
             let result_rows = record_batch.num_rows();
             if result_rows > part.nums_rows {
                 return Err(ErrorCode::BadBytes(format!(
@@ -413,8 +417,7 @@ impl ReadState {
                 )));
             }
             if let Some(sel) = row_selection.as_ref() {
-                record_batch =
-                    filter_vortex_record_batch_with_row_selection(record_batch, sel)?;
+                record_batch = filter_vortex_record_batch_with_row_selection(record_batch, sel)?;
             }
             self.remain_reader
                 .map_vortex_record_batch_to_data_block(&record_batch)

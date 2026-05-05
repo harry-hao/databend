@@ -96,37 +96,38 @@ impl VortexDeserializeDataTransform {
             .and_then(|p| p.prewhere.as_ref())
             .cloned();
 
-        let read_state = if prewhere_info.is_some()
-            || !ctx.get_runtime_filters(plan.scan_id).is_empty()
-        {
-            Some(ReadState::create(
-                ctx.clone(),
-                plan.scan_id,
-                prewhere_info.as_ref(),
-                block_reader.as_ref(),
-            )?)
-        } else {
-            None
-        };
+        let read_state =
+            if prewhere_info.is_some() || !ctx.get_runtime_filters(plan.scan_id).is_empty() {
+                Some(ReadState::create(
+                    ctx.clone(),
+                    plan.scan_id,
+                    prewhere_info.as_ref(),
+                    block_reader.as_ref(),
+                )?)
+            } else {
+                None
+            };
 
         let (need_reserve_block_info, _) = need_reserve_block_info(ctx.clone(), plan.table_index);
-        Ok(ProcessorPtr::create(Box::new(VortexDeserializeDataTransform {
-            ctx: ctx.clone(),
-            scan_id: plan.scan_id,
-            scan_progress,
-            block_reader,
-            index_reader,
-            input,
-            output,
-            output_data: None,
-            src_schema,
-            output_schema,
-            parts: vec![],
-            chunks: vec![],
-            base_block_ids: plan.base_block_ids.clone(),
-            need_reserve_block_info,
-            read_state,
-        })))
+        Ok(ProcessorPtr::create(Box::new(
+            VortexDeserializeDataTransform {
+                ctx: ctx.clone(),
+                scan_id: plan.scan_id,
+                scan_progress,
+                block_reader,
+                index_reader,
+                input,
+                output,
+                output_data: None,
+                src_schema,
+                output_schema,
+                parts: vec![],
+                chunks: vec![],
+                base_block_ids: plan.base_block_ids.clone(),
+                need_reserve_block_info,
+                read_state,
+            },
+        )))
     }
 }
 
@@ -161,7 +162,7 @@ impl Processor for VortexDeserializeDataTransform {
                 self.input.set_need_data();
             }
 
-            return Ok(Event::Sync);
+            return Ok(Event::Async);
         }
 
         if self.input.has_data() {
@@ -176,7 +177,7 @@ impl Processor for VortexDeserializeDataTransform {
                         .into_iter()
                         .map(ReadDataSource::into_vortex)
                         .collect::<Result<Vec<_>>>()?;
-                    return Ok(Event::Sync);
+                    return Ok(Event::Async);
                 }
             }
 
@@ -192,7 +193,7 @@ impl Processor for VortexDeserializeDataTransform {
         Ok(Event::NeedData)
     }
 
-    fn process(&mut self) -> Result<()> {
+    async fn async_process(&mut self) -> Result<()> {
         let part = self.parts.pop();
         let chunks = self.chunks.pop();
         if let Some((part, read_res)) = part.zip(chunks) {
@@ -218,42 +219,58 @@ impl Processor for VortexDeserializeDataTransform {
                     let fuse_part = FuseBlockPartInfo::from_part(&part)?;
 
                     let mut data_block = match &self.read_state {
-                        Some(read_state) => match (&read_state.filters, read_state.runtime_filters.is_empty()) {
-                            (Some(filter), true) => {
-                                match translate_expr_to_vortex(filter, &read_state.prewhere_schema)? {
-                                    Some(vortex_filter) => {
-                                        let extra = referenced_field_names(filter, &read_state.prewhere_schema);
-                                        self.block_reader.deserialize_vortex_chunks_with_scan_filter(
-                                            &fuse_part.location,
-                                            fuse_part.nums_rows,
-                                            &fuse_part.columns_meta,
-                                            std::collections::HashMap::new(),
-                                            None,
-                                            Some(vortex_filter),
-                                            extra,
-                                            None,
-                                        )?
-                                    }
-                                    None => {
-                                        let (data_block, _row_selection, _bitmap) =
-                                            read_state.deserialize_and_filter_vortex(&fuse_part)?;
-                                        data_block
+                        Some(read_state) => {
+                            match (&read_state.filters, read_state.runtime_filters.is_empty()) {
+                                (Some(filter), true) => {
+                                    match translate_expr_to_vortex(
+                                        filter,
+                                        &read_state.prewhere_schema,
+                                    )? {
+                                        Some(vortex_filter) => {
+                                            let extra = referenced_field_names(
+                                                filter,
+                                                &read_state.prewhere_schema,
+                                            );
+                                            self.block_reader
+                                                .deserialize_vortex_chunks_with_scan_filter_async(
+                                                    &fuse_part.location,
+                                                    fuse_part.nums_rows,
+                                                    &fuse_part.columns_meta,
+                                                    std::collections::HashMap::new(),
+                                                    None,
+                                                    Some(vortex_filter),
+                                                    extra,
+                                                    None,
+                                                )
+                                                .await?
+                                        }
+                                        None => {
+                                            let (data_block, _row_selection, _bitmap) = read_state
+                                                .deserialize_and_filter_vortex_async(&fuse_part)
+                                                .await?;
+                                            data_block
+                                        }
                                     }
                                 }
+                                _ => {
+                                    let (data_block, _row_selection, _bitmap) = read_state
+                                        .deserialize_and_filter_vortex_async(&fuse_part)
+                                        .await?;
+                                    data_block
+                                }
                             }
-                            _ => {
-                                let (data_block, _row_selection, _bitmap) =
-                                    read_state.deserialize_and_filter_vortex(&fuse_part)?;
-                                data_block
-                            }
-                        },
-                        None => self.block_reader.deserialize_vortex_chunks(
-                            &fuse_part.location,
-                            fuse_part.nums_rows,
-                            &fuse_part.columns_meta,
-                            std::collections::HashMap::new(),
-                            None,
-                        )?,
+                        }
+                        None => {
+                            self.block_reader
+                                .deserialize_vortex_chunks_async(
+                                    &fuse_part.location,
+                                    fuse_part.nums_rows,
+                                    &fuse_part.columns_meta,
+                                    std::collections::HashMap::new(),
+                                    None,
+                                )
+                                .await?
+                        }
                     };
 
                     metrics_inc_remote_io_deserialize_milliseconds(

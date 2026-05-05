@@ -42,8 +42,8 @@ use crate::io::BlockReader;
 use crate::io::VirtualColumnReader;
 use crate::operations::read::DeserializeDataTransform;
 use crate::operations::read::NativeDeserializeDataTransform;
-use crate::operations::read::VortexDeserializeDataTransform;
 use crate::operations::read::TransformRuntimeFilterWait;
+use crate::operations::read::VortexDeserializeDataTransform;
 use crate::operations::read::block_partition_receiver_source::BlockPartitionReceiverSource;
 use crate::operations::read::block_partition_source::BlockPartitionSource;
 
