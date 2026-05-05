@@ -56,8 +56,8 @@ impl OpendalReadAt {
         Ok(Self {
             reader,
             size: meta.content_length(),
-            performance_hint: PerformanceHint::object_storage(),
-            // performance_hint: PerformanceHint::local(),
+            // performance_hint: PerformanceHint::object_storage(),
+            performance_hint: PerformanceHint::local(),
         })
     }
 }

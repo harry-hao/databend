@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use databend_common_exception::Result;
 use databend_common_expression::DataSchema;
 use databend_common_expression::Expr;
@@ -19,8 +21,12 @@ use databend_common_expression::Scalar;
 use databend_common_expression::types::DataType;
 use databend_common_expression::types::NumberScalar;
 use vortex::dtype::DType;
+use vortex::dtype::ExtDType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
+use vortex::dtype::datetime::DATE_ID;
+use vortex::dtype::datetime::TemporalMetadata;
+use vortex::dtype::datetime::TimeUnit;
 use vortex::expr::Expression;
 use vortex::expr::and;
 use vortex::expr::col;
@@ -65,14 +71,6 @@ fn translate_expr_to_vortex_inner(expr: &Expr, schema: &DataSchema) -> Option<Ex
         }
         Expr::ColumnRef(c) => {
             let name = schema.fields().get(c.id)?.name();
-
-            // Reject "nested" references aggressively. In practice, nested access often keeps the
-            // original display (e.g. `a.b`) even after projection, and Vortex scan pushdown for
-            // nested columns is not part of Phase2.
-            let display = c.display_name.as_str();
-            if is_nested_display_name(display) {
-                return None;
-            }
             Some(col(name.as_str()))
         }
         Expr::FunctionCall(call) => {
@@ -99,34 +97,22 @@ fn translate_expr_to_vortex_inner(expr: &Expr, schema: &DataSchema) -> Option<Ex
 
                 // Binary comparisons.
                 ("eq" | "=", [lhs, rhs]) => {
-                    let lhs = translate_expr_to_vortex_inner(lhs, schema)?;
-                    let rhs = translate_expr_to_vortex_inner(rhs, schema)?;
-                    Some(eq(lhs, rhs))
+                    translate_binary_compare(lhs, rhs, schema, eq)
                 }
                 ("ne" | "noteq" | "!=", [lhs, rhs]) => {
-                    let lhs = translate_expr_to_vortex_inner(lhs, schema)?;
-                    let rhs = translate_expr_to_vortex_inner(rhs, schema)?;
-                    Some(not_eq(lhs, rhs))
+                    translate_binary_compare(lhs, rhs, schema, not_eq)
                 }
                 ("lt" | "<", [lhs, rhs]) => {
-                    let lhs = translate_expr_to_vortex_inner(lhs, schema)?;
-                    let rhs = translate_expr_to_vortex_inner(rhs, schema)?;
-                    Some(lt(lhs, rhs))
+                    translate_binary_compare(lhs, rhs, schema, lt)
                 }
                 ("le" | "lte" | "<=", [lhs, rhs]) => {
-                    let lhs = translate_expr_to_vortex_inner(lhs, schema)?;
-                    let rhs = translate_expr_to_vortex_inner(rhs, schema)?;
-                    Some(lt_eq(lhs, rhs))
+                    translate_binary_compare(lhs, rhs, schema, lt_eq)
                 }
                 ("gt" | ">", [lhs, rhs]) => {
-                    let lhs = translate_expr_to_vortex_inner(lhs, schema)?;
-                    let rhs = translate_expr_to_vortex_inner(rhs, schema)?;
-                    Some(gt(lhs, rhs))
+                    translate_binary_compare(lhs, rhs, schema, gt)
                 }
                 ("ge" | "gte" | ">=", [lhs, rhs]) => {
-                    let lhs = translate_expr_to_vortex_inner(lhs, schema)?;
-                    let rhs = translate_expr_to_vortex_inner(rhs, schema)?;
-                    Some(gt_eq(lhs, rhs))
+                    translate_binary_compare(lhs, rhs, schema, gt_eq)
                 }
 
                 // Explicitly reject LIKE / IN and everything else.
@@ -141,6 +127,20 @@ fn translate_expr_to_vortex_inner(expr: &Expr, schema: &DataSchema) -> Option<Ex
     }
 }
 
+fn translate_binary_compare<F>(
+    lhs: &Expr,
+    rhs: &Expr,
+    schema: &DataSchema,
+    build: F,
+) -> Option<Expression>
+where
+    F: Fn(Expression, Expression) -> Expression,
+{
+    let lhs = translate_expr_to_vortex_inner(lhs, schema)?;
+    let rhs = translate_expr_to_vortex_inner(rhs, schema)?;
+    Some(build(lhs, rhs))
+}
+
 fn collect_referenced_field_names(
     expr: &Expr,
     schema: &DataSchema,
@@ -149,11 +149,11 @@ fn collect_referenced_field_names(
     match expr {
         Expr::Constant(_) => Some(()),
         Expr::ColumnRef(c) => {
+            let name = schema.fields().get(c.id)?.name();
             let display = c.display_name.as_str();
-            if is_nested_display_name(display) {
+            if is_nested_column_ref(display, name) {
                 return None;
             }
-            let name = schema.fields().get(c.id)?.name();
             out.insert(name.to_string());
             Some(())
         }
@@ -178,6 +178,42 @@ fn is_nested_display_name(display_name: &str) -> bool {
         || display_name.contains(')')
 }
 
+fn is_nested_column_ref(display_name: &str, schema_name: &str) -> bool {
+    // Accept common qualified display forms like `table.col` and `table.col (#id)`.
+    // Nested references should still be rejected.
+    let normalized = display_name
+        .split_once(" (#")
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(display_name)
+        .trim();
+
+    if normalized == schema_name {
+        return false;
+    }
+
+    if normalized.ends_with(schema_name) {
+        let prefix_len = normalized.len().saturating_sub(schema_name.len());
+        let prefix = &normalized[..prefix_len];
+        if prefix.ends_with('.') {
+            let qualifier = &prefix[..prefix.len().saturating_sub(1)];
+            // Treat one-identifier qualifier (`table.col` or `alias.col`) as non-nested.
+            if !qualifier.is_empty() && !qualifier.contains('.') {
+                return false;
+            }
+        }
+    }
+
+    is_nested_display_name(normalized)
+}
+
+fn vortex_date_ext_dtype(nullability: Nullability) -> Arc<ExtDType> {
+    Arc::new(ExtDType::new(
+        DATE_ID.clone(),
+        Arc::new(DType::Primitive(PType::I32, nullability)),
+        Some(TemporalMetadata::Date(TimeUnit::Days).into()),
+    ))
+}
+
 fn vortex_scalar_from_databend(s: &Scalar, ty: &DataType) -> Option<VortexScalar> {
     let nullability = if matches!(s, Scalar::Null) {
         Nullability::Nullable
@@ -193,6 +229,11 @@ fn vortex_scalar_from_databend(s: &Scalar, ty: &DataType) -> Option<VortexScalar
         Scalar::Boolean(v) => Some(VortexScalar::bool(*v, nullability)),
         Scalar::String(v) => Some(VortexScalar::utf8(v.clone(), nullability)),
         Scalar::Binary(v) => Some(VortexScalar::binary(v.clone(), nullability)),
+        Scalar::Date(v) => {
+            let ext_dtype = vortex_date_ext_dtype(nullability);
+            let storage = VortexScalar::primitive(*v, nullability);
+            Some(VortexScalar::extension(ext_dtype, storage))
+        }
         Scalar::Number(n) => match n {
             NumberScalar::Int8(v) => Some(VortexScalar::primitive(*v, nullability)),
             NumberScalar::Int16(v) => Some(VortexScalar::primitive(*v, nullability)),
@@ -215,6 +256,7 @@ fn vortex_dtype_from_databend(ty: &DataType, nullability: Nullability) -> Option
         DataType::Boolean => Some(DType::Bool(nullability)),
         DataType::Binary => Some(DType::Binary(nullability)),
         DataType::String => Some(DType::Utf8(nullability)),
+        DataType::Date => Some(DType::Extension(vortex_date_ext_dtype(nullability))),
         DataType::Number(n) => {
             let p = match n {
                 databend_common_expression::types::NumberDataType::Int8 => PType::I8,
@@ -247,8 +289,12 @@ mod tests {
     use databend_common_expression::types::NumberDataType;
     use databend_common_expression::types::NumberScalar;
     use databend_common_functions::BUILTIN_FUNCTIONS;
+    use vortex::dtype::DType;
 
+    use super::DATE_ID;
+    use super::referenced_field_names;
     use super::translate_expr_to_vortex;
+    use super::vortex_scalar_from_databend;
 
     fn col_ref(id: usize, display_name: &str, data_type: DataType) -> Expr {
         Expr::ColumnRef(ColumnRef {
@@ -272,6 +318,14 @@ mod tests {
             span: None,
             scalar: Scalar::String(v.to_string()),
             data_type: DataType::String,
+        })
+    }
+
+    fn lit_date(v: i32) -> Expr {
+        Expr::Constant(Constant {
+            span: None,
+            scalar: Scalar::Date(v),
+            data_type: DataType::Date,
         })
     }
 
@@ -341,13 +395,61 @@ mod tests {
     }
 
     #[test]
-    fn nested_column_ref_translates_none() {
+    fn nested_column_ref_display_name_translates_some() {
         let schema = schema_ab_i64();
         let a_nested = col_ref(0, "a.b", DataType::Number(NumberDataType::Int64));
         let expr =
             check_function(None, "eq", &[], &[a_nested, lit_i64(1)], &BUILTIN_FUNCTIONS).unwrap();
 
         let translated = translate_expr_to_vortex(&expr, &schema).unwrap();
-        assert!(translated.is_none());
+        let translated = translated.expect("expected Some(Expression)");
+        let s = translated.to_string();
+        assert!(s.contains("$.a"), "expr: {s}");
+    }
+
+    #[test]
+    fn qualified_display_name_translates_some() {
+        let schema = schema_ab_i64();
+        let a = col_ref(0, "t.a (#0)", DataType::Number(NumberDataType::Int64));
+        let expr = check_function(None, "eq", &[], &[a, lit_i64(1)], &BUILTIN_FUNCTIONS).unwrap();
+
+        let translated = translate_expr_to_vortex(&expr, &schema).unwrap();
+        let translated = translated.expect("expected Some(Expression)");
+        let s = translated.to_string();
+        assert!(s.contains("$.a"), "expr: {s}");
+    }
+
+    #[test]
+    fn qualified_display_name_referenced_field_name_ok() {
+        let schema = schema_ab_i64();
+        let a = col_ref(0, "t.a (#0)", DataType::Number(NumberDataType::Int64));
+        let expr = check_function(None, "eq", &[], &[a, lit_i64(1)], &BUILTIN_FUNCTIONS).unwrap();
+
+        let names = referenced_field_names(&expr, &schema).expect("expected referenced fields");
+        assert_eq!(names.iter().map(|n| n.as_ref()).collect::<Vec<_>>(), vec!["a"]);
+    }
+
+    #[test]
+    fn date_literal_ge_translates_some() {
+        let schema = DataSchema::new(vec![DataField::new("d", DataType::Date)]);
+        let d = col_ref(0, "d", DataType::Date);
+        let expr = check_function(None, "ge", &[], &[d, lit_date(15887)], &BUILTIN_FUNCTIONS)
+            .unwrap();
+
+        let translated = translate_expr_to_vortex(&expr, &schema).unwrap();
+        assert!(translated.is_some());
+    }
+
+    #[test]
+    fn date_scalar_uses_extension_dtype() {
+        let scalar = vortex_scalar_from_databend(&Scalar::Date(15887), &DataType::Date)
+            .expect("expected date scalar conversion");
+        let dtype = scalar.dtype();
+        match dtype {
+            DType::Extension(ext) => {
+                assert_eq!(ext.id(), &*DATE_ID);
+            }
+            _ => panic!("expected extension dtype, got {dtype}"),
+        }
     }
 }

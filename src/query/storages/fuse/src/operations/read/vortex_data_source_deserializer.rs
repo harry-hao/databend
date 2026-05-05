@@ -222,11 +222,15 @@ impl Processor for VortexDeserializeDataTransform {
                         Some(read_state) => {
                             match (&read_state.filters, read_state.runtime_filters.is_empty()) {
                                 (Some(filter), true) => {
-                                    match translate_expr_to_vortex(
-                                        filter,
-                                        &read_state.prewhere_schema,
-                                    )? {
+                                    let translated_filter =
+                                        translate_expr_to_vortex(filter, &read_state.prewhere_schema)?;
+
+                                    match translated_filter {
                                         Some(vortex_filter) => {
+                                            Profile::record_usize_profile(
+                                                ProfileStatisticsName::VortexPredicatePushdownCount,
+                                                1,
+                                            );
                                             let extra = referenced_field_names(
                                                 filter,
                                                 &read_state.prewhere_schema,

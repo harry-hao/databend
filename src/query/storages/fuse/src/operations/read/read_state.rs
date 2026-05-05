@@ -366,6 +366,7 @@ impl ReadState {
             preread_block = preread_block.filter_with_bitmap(bitmap)?;
         }
 
+
         let row_selection = bitmap_selection.as_ref().map(RowSelection::from);
         if row_selection.as_ref().is_some_and(|s| s.selected_rows == 0) {
             // If prewhere/runtime filters select zero rows, avoid the remain-stage scan entirely.
