@@ -284,6 +284,7 @@ pub(crate) async fn open_vortex_file_async(
     })?;
     let file = session_for_open
         .open_options()
+        .with_initial_read_size(0)
         .open_read_at(read_at)
         .await
         .map_err(|e| {
