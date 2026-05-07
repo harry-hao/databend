@@ -7,16 +7,17 @@ Audience: Databend storage / Fuse / Vortex integration
 ## Summary
 
 This spec proposes a process-wide footer cache for Fuse Vortex block reads so Databend can reuse
-parsed Vortex `Footer` metadata across repeated opens of the same block file.
+parsed Vortex `Footer` metadata across repeated opens of the same block file. The cache is bounded
+by a fixed default capacity of **1024 cached footers**.
 
 The cache stores:
 
 - **key**: `location`
-- **value**: `VortexFooterEntry { footer, approx_bytes }`
+- **value**: `Footer`
 
 On cache hit, Databend will open the Vortex file with:
 
-- `session.open_options().with_footer(cached.footer.clone()).open_read_at(read_at)`
+- `session.open_options().with_footer(cached_footer.clone()).open_read_at(read_at)`
 
 This avoids repeated footer reads and footer deserialization while keeping the rest of the scan path
 unchanged.
@@ -38,7 +39,7 @@ block file is reopened in the process.
 - **G1**: Reuse a previously parsed `Footer` for the same Fuse Vortex block `location`.
 - **G2**: Integrate with Databend's existing cache conventions (`CacheManager`,
   `InMemoryLruCache`).
-- **G3**: Support byte-based eviction using a stable approximation of footer size.
+- **G3**: Use a simple count-based eviction policy with a default capacity of 1024 entries.
 - **G4**: Avoid duplicate concurrent footer loads for the same `location`.
 - **G5**: Keep the change local to the Vortex open path; scanning and decoding behavior should stay
   the same.
@@ -49,7 +50,7 @@ block file is reopened in the process.
   state.
 - **NG2**: Do not introduce active invalidation or mutation tracking for Fuse block files.
 - **NG3**: Do not change block pruning, projection planning, or scan semantics.
-- **NG4**: Do not require upgrading Databend from `vortex 0.56.0`.
+- **NG4**: Do not require footer-size accounting or per-entry byte estimation.
 
 ## Background and constraints
 
@@ -59,17 +60,11 @@ For Fuse block files, `location` is treated as the identity of an immutable obje
 written as new files and referenced by new snapshot / segment metadata rather than appended in
 place. Therefore, using `location` as the footer-cache key is acceptable for this design.
 
-### Vortex version constraint
-
-Databend currently uses `vortex 0.56.0`. Unlike newer Vortex releases used by
-`vortex-datafusion`, this version does not expose `Footer::approx_byte_size()`. Therefore, Databend
-must compute an approximate size itself.
-
 ### Existing Databend cache conventions
 
 Databend's storage caches are centrally managed via `CacheManager`, while individual caches are
 implemented using typed wrappers such as `InMemoryLruCache<T>`. Those caches use `String` keys and
-obtain byte-based eviction data from `CacheValue<T>::mem_bytes`.
+can be configured either by item count or by bytes.
 
 ## Alternatives considered
 
@@ -97,22 +92,10 @@ obtain byte-based eviction data from `CacheValue<T>::mem_bytes`.
 
 ### Cache entry
 
-Introduce a small internal cached value:
+Store the reusable Vortex `Footer` directly as the cached value.
 
-```rust
-struct VortexFooterEntry {
-    footer: Footer,
-    approx_bytes: usize,
-}
-```
-
-Responsibilities:
-
-- `footer`: reusable Vortex footer object
-- `approx_bytes`: cache accounting value used for byte-based eviction
-
-`VortexFooterEntry` should implement conversion into `CacheValue<VortexFooterEntry>` so
-`approx_bytes` is recorded once at insertion time and reused by `InMemoryLruCache`.
+No wrapper struct is required for the first version because the cache will evict by item count
+rather than by estimated bytes.
 
 ### Cache location
 
@@ -122,7 +105,7 @@ Add a dedicated cache slot to `CacheManager`, for example:
 
 Where:
 
-- `type VortexFooterCache = InMemoryLruCache<VortexFooterEntry>;`
+- `type VortexFooterCache = InMemoryLruCache<Footer>;`
 
 This keeps the new cache aligned with Databend's existing storage-cache structure and exposes a
 clear getter similar to other cache types.
@@ -137,23 +120,18 @@ This matches:
 - existing Databend cache patterns such as parquet metadata
 - the immutability model of Fuse block files
 
-### Footer size accounting
+### Cache capacity
 
-Since `Footer` in `vortex 0.56.0` does not provide `approx_byte_size()`, compute the cache size
-once on insert using:
+Use an item-count cache with a default capacity of **1024** entries.
 
-```rust
-footer.clone().into_serializer().serialize()
-```
+Rationale:
 
-Then sum the lengths of the returned buffers:
+- avoids introducing custom size-accounting logic for `Footer`
+- matches the user-approved simplification for this design
+- keeps the first implementation focused on correctness and reuse behavior
 
-```rust
-let approx_bytes = buffers.iter().map(|b| b.len()).sum();
-```
-
-This is an approximation of serialized footer size, not exact in-memory residency, but it is good
-enough for eviction accounting and closely mirrors how newer Vortex versions estimate footer size.
+If realistic workloads later show that item-count eviction is insufficient, byte-based accounting can
+be introduced in a follow-up change.
 
 ### Concurrency behavior
 
@@ -176,12 +154,11 @@ Modify `open_vortex_file_async(...)` as the single integration point:
 1. Create / obtain the `read_at` source as today.
 2. Look up `location` in the global footer cache.
 3. On hit:
-   - call `open_options().with_footer(cached.footer.clone()).open_read_at(read_at)`
+   - call `open_options().with_footer(cached_footer.clone()).open_read_at(read_at)`
 4. On miss:
    - call the existing open path without `with_footer(...)`
    - extract `file.footer().clone()`
-   - compute `approx_bytes` from `serialize()`
-   - insert the new `VortexFooterEntry`
+   - insert the new `Footer`
 5. Return the opened file wrapper as today.
 
 The scan and decode path remains unchanged.
@@ -192,8 +169,8 @@ The scan and decode path remains unchanged.
 
 1. Caller requests `open_vortex_file_async(operator, location)`
 2. `read_at` is created
-3. footer cache returns `VortexFooterEntry`
-4. open uses `with_footer(entry.footer.clone())`
+3. footer cache returns `Footer`
+4. open uses `with_footer(cached_footer.clone())`
 5. Vortex open skips footer read/parse work
 6. scan proceeds normally
 
@@ -203,14 +180,11 @@ The scan and decode path remains unchanged.
 2. in-flight dedup decides whether this caller loads or waits
 3. loader opens file through the normal path
 4. loader clones `file.footer()`
-5. loader computes `approx_bytes` from serialized buffers
-6. loader inserts cache entry
-7. waiters resume and use the cached footer on later opens
+5. loader inserts cache entry
+6. waiters resume and use the cached footer on later opens
 
 ## Error handling
 
-- If footer serialization for size accounting fails, the open should still fail explicitly rather
-  than silently inserting a size-less entry.
 - Failed opens must **not** populate the cache.
 - Failed loads must wake waiters and propagate the same error; waiters must not hang.
 - If an in-flight load fails, the in-flight marker must be cleaned up so later attempts can retry.
@@ -221,7 +195,7 @@ The scan and decode path remains unchanged.
 
 - Add a Vortex-focused test showing that repeated opens of the same `location` populate and reuse
   the footer cache.
-- Add a test for byte-based cache insertion using the serialized footer size.
+- Add a test for count-based cache insertion and eviction at the configured capacity.
 - Add a test ensuring concurrent misses for the same `location` are coalesced rather than loaded
   multiple times.
 
@@ -235,5 +209,3 @@ The scan and decode path remains unchanged.
 
 - This cache should start as an internal Vortex/Fuse optimization only.
 - Capacity can be tuned independently after observing realistic workloads.
-- If Databend upgrades to a Vortex version with `Footer::approx_byte_size()`, the custom serialized
-  size computation can be replaced with the native API.
