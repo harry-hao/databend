@@ -44,9 +44,9 @@ use crate::fuse_part::FuseBlockPartInfo;
 use crate::io::BlockReader;
 use crate::io::DataItem;
 use crate::io::RowSelection;
-use crate::io::read::block::filter_vortex_record_batch_with_row_selection;
 use crate::io::read::block::open_vortex_file_async;
 use crate::io::read::block::scan_opened_vortex_file_to_record_batch;
+use crate::io::read::block::vortex_row_indices_from_row_selection;
 use crate::pruning::ExprBloomFilter;
 
 #[derive(Clone)]
@@ -402,12 +402,15 @@ impl ReadState {
                 )
             })?;
             let projection = self.remain_reader.vortex_field_names_for_scan(None)?;
-            let mut record_batch = scan_opened_vortex_file_to_record_batch(
+            let remain_row_indices = row_selection
+                .as_ref()
+                .map(vortex_row_indices_from_row_selection);
+            let record_batch = scan_opened_vortex_file_to_record_batch(
                 opened,
                 "remain",
                 Some(projection),
                 None,
-                None,
+                remain_row_indices.as_deref(),
             )
             .await?;
             let result_rows = record_batch.num_rows();
@@ -416,9 +419,6 @@ impl ReadState {
                     "FUSE storage_format='vortex' decoded rows {result_rows} exceeds metadata {}",
                     part.nums_rows,
                 )));
-            }
-            if let Some(sel) = row_selection.as_ref() {
-                record_batch = filter_vortex_record_batch_with_row_selection(record_batch, sel)?;
             }
             self.remain_reader
                 .map_vortex_record_batch_to_data_block(&record_batch)

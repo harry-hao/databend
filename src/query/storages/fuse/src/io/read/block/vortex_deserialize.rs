@@ -23,6 +23,7 @@ use arrow_select::filter::filter_record_batch;
 use dashmap::DashMap;
 use databend_common_base::runtime::GlobalIORuntime;
 use databend_common_catalog::plan::Projection;
+use databend_common_column::bitmap::utils::SlicesIterator;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::BlockEntry;
@@ -270,6 +271,16 @@ pub(crate) fn filter_vortex_record_batch_with_row_selection(
     })
 }
 
+pub(crate) fn vortex_row_indices_from_row_selection(selection: &RowSelection) -> Vec<u32> {
+    let mut out = Vec::with_capacity(selection.selected_rows);
+    for (start, len) in SlicesIterator::new(&selection.bitmap) {
+        for idx in start..start + len {
+            out.push(idx as u32);
+        }
+    }
+    out
+}
+
 /// Holds a single opened Vortex block file together with the runtime and session used to open it,
 /// so scan/decode can be performed (once or multiple times) without reopening the underlying file.
 /// Fields are ordered so `file` drops before `_session` and `rt` (declaration-order drop).
@@ -502,5 +513,27 @@ fn column_name_paths(projection: &Projection, schema: &TableSchema) -> Vec<Vec<S
             }
             name_paths
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use databend_common_expression::types::MutableBitmap;
+
+    use super::*;
+
+    #[test]
+    fn test_vortex_row_indices_from_row_selection() {
+        let mut bitmap = MutableBitmap::from_len_zeroed(8);
+        bitmap.set(1, true);
+        bitmap.set(4, true);
+        bitmap.set(5, true);
+        bitmap.set(7, true);
+        let bitmap: Bitmap = bitmap.into();
+        let selection = RowSelection::from(&bitmap);
+
+        let indices = vortex_row_indices_from_row_selection(&selection);
+
+        assert_eq!(indices, vec![1, 4, 5, 7]);
     }
 }
