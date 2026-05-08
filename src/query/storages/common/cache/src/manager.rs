@@ -53,11 +53,13 @@ use crate::caches::TableSnapshotCache;
 use crate::caches::TableSnapshotStatisticCache;
 use crate::caches::VectorIndexFileCache;
 use crate::caches::VectorIndexMetaCache;
+use crate::caches::VortexFooterCache;
 use crate::caches::VirtualColumnMetaCache;
 use crate::providers::HybridCache;
 use crate::providers::HybridCacheExt;
 
 static DEFAULT_PARQUET_META_DATA_CACHE_ITEMS: usize = 3000;
+static DEFAULT_VORTEX_FOOTER_CACHE_ITEMS: usize = 1024;
 
 // Minimum threshold for table data disk cache size (in bytes).
 // Any configuration value less than this threshold will be ignored,
@@ -122,6 +124,7 @@ pub struct CacheManager {
     in_memory_table_data_cache: CacheSlot<ColumnArrayCache>,
     segment_block_metas_cache: CacheSlot<SegmentBlockMetasCache>,
     block_meta_cache: CacheSlot<BlockMetaCache>,
+    vortex_footer_cache: CacheSlot<VortexFooterCache>,
 
     column_data_cache: CacheSlot<ColumnDataCache>,
     // icebergs
@@ -252,6 +255,7 @@ impl CacheManager {
                 in_memory_table_data_cache,
                 segment_block_metas_cache: CacheSlot::new(None),
                 block_meta_cache: CacheSlot::new(None),
+                vortex_footer_cache: CacheSlot::new(None),
                 column_data_cache,
                 iceberg_table_meta_cache: CacheSlot::new(None),
                 allows_on_disk_cache,
@@ -482,6 +486,11 @@ impl CacheManager {
                 config.block_meta_count as usize,
             );
 
+            let vortex_footer_cache = Self::new_items_cache_slot(
+                MEMORY_CACHE_VORTEX_FOOTER,
+                DEFAULT_VORTEX_FOOTER_CACHE_ITEMS,
+            );
+
             let iceberg_table_meta_cache = Self::new_items_cache_slot(
                 MEMORY_CACHE_ICEBERG_TABLE,
                 config.iceberg_table_meta_count as usize,
@@ -507,6 +516,7 @@ impl CacheManager {
                 segment_block_metas_cache,
                 parquet_meta_data_cache,
                 block_meta_cache,
+                vortex_footer_cache,
                 iceberg_table_meta_cache,
                 allows_on_disk_cache,
                 column_data_cache,
@@ -658,6 +668,9 @@ impl CacheManager {
             MEMORY_CACHE_BLOCK_META => {
                 Self::set_items_capacity(&self.block_meta_cache, new_capacity, name);
             }
+            MEMORY_CACHE_VORTEX_FOOTER => {
+                Self::set_items_capacity(&self.vortex_footer_cache, new_capacity, name);
+            }
 
             HYBRID_CACHE_COLUMN_DATA | IN_MEMORY_HYBRID_CACHE_COLUMN_DATA => {
                 Self::set_hybrid_cache_bytes_capacity(&self.column_data_cache, new_capacity, name);
@@ -763,6 +776,10 @@ impl CacheManager {
 
     pub fn get_block_meta_cache(&self) -> Option<BlockMetaCache> {
         self.block_meta_cache.get()
+    }
+
+    pub fn get_vortex_footer_cache(&self) -> Option<VortexFooterCache> {
+        self.vortex_footer_cache.get()
     }
 
     pub fn get_iceberg_table_cache(&self) -> Option<IcebergTableCache> {
@@ -1005,6 +1022,7 @@ const MEMORY_CACHE_SEGMENT_BLOCK_METAS: &str = "memory_cache_segment_block_metas
 const MEMORY_CACHE_ICEBERG_TABLE: &str = "memory_cache_iceberg_table";
 
 const MEMORY_CACHE_BLOCK_META: &str = "memory_cache_block_meta";
+const MEMORY_CACHE_VORTEX_FOOTER: &str = "memory_cache_vortex_footer";
 
 #[cfg(test)]
 mod tests {
@@ -1458,6 +1476,38 @@ mod tests {
             20
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_cache_manager_vortex_footer_cache_defaults() -> Result<()> {
+        use vortex::file::Footer;
+
+        let max_server_memory_usage = 1024 * 1024;
+        let cache_config = CacheConfig {
+            enable_table_meta_cache: true,
+            ..Default::default()
+        };
+
+        let cache_manager = CacheManager::try_new(
+            &cache_config,
+            &max_server_memory_usage,
+            "test_tenant_id",
+            false,
+        )?;
+
+        let cache = cache_manager
+            .get_vortex_footer_cache()
+            .expect("vortex footer cache should be initialized");
+
+        assert_eq!(cache.name(), MEMORY_CACHE_VORTEX_FOOTER);
+        assert_eq!(cache.items_capacity(), 1024);
+        assert_eq!(cache.len(), 0);
+
+        cache_manager.set_cache_capacity(MEMORY_CACHE_VORTEX_FOOTER, 32)?;
+        assert_eq!(cache.items_capacity(), 32);
+
+        let _ = std::any::TypeId::of::<Footer>();
         Ok(())
     }
 

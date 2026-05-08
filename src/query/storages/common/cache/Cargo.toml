@@ -30,6 +30,7 @@ parquet = { workspace = true }
 rayon = { workspace = true }
 rustix = { workspace = true }
 siphasher = { workspace = true }
+vortex = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }

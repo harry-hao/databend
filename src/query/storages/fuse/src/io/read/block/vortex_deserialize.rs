@@ -13,11 +13,14 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::LazyLock;
 
 use arrow_array::ArrayRef;
 use arrow_array::RecordBatch;
 use arrow_array::StructArray;
 use arrow_select::filter::filter_record_batch;
+use dashmap::DashMap;
 use databend_common_base::runtime::GlobalIORuntime;
 use databend_common_catalog::plan::Projection;
 use databend_common_exception::ErrorCode;
@@ -30,9 +33,12 @@ use databend_common_expression::TableSchema;
 use databend_common_expression::Value;
 use databend_common_expression::types::Bitmap;
 use databend_common_metrics::storage::metrics_inc_remote_io_read_parts;
+use databend_storages_common_cache::CacheAccessor;
+use databend_storages_common_cache::CacheManager;
 use databend_storages_common_table_meta::meta::ColumnMeta;
 use futures_util::StreamExt;
 use futures_util::pin_mut;
+use tokio::sync::Mutex;
 use vortex::IntoArray;
 use vortex::VortexSessionDefault;
 use vortex::arrays::ChunkedArray;
@@ -42,6 +48,7 @@ use vortex::dtype::FieldNames;
 use vortex::expr::Expression;
 use vortex::expr::root;
 use vortex::expr::select;
+use vortex::file::Footer;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::VortexFile;
 use vortex::io::session::RuntimeSessionExt;
@@ -53,6 +60,9 @@ use super::vortex_read_at::OpendalReadAt;
 use crate::io::BlockReader;
 use crate::io::read::block::block_reader_merge_io::DataItem;
 use crate::io::vortex_runtime::vortex_handle;
+
+static IN_FLIGHT_VORTEX_FOOTERS: LazyLock<DashMap<String, Arc<Mutex<()>>>> =
+    LazyLock::new(DashMap::new);
 
 impl BlockReader {
     /// Build top-level Vortex field projection for this reader, optionally merging extra names.
@@ -274,6 +284,51 @@ pub(crate) async fn open_vortex_file_async(
 ) -> Result<OpenedVortexFile> {
     metrics_inc_remote_io_read_parts(1);
 
+    if let Some(footer) = get_cached_vortex_footer(location) {
+        return open_vortex_file_with_footer_async(operator, location, Some(footer)).await;
+    }
+
+    let load_lock = IN_FLIGHT_VORTEX_FOOTERS
+        .entry(location.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let _guard = load_lock.lock().await;
+
+    if let Some(footer) = get_cached_vortex_footer_without_miss(location) {
+        return open_vortex_file_with_footer_async(operator, location, Some(footer)).await;
+    }
+
+    let opened = open_vortex_file_with_footer_async(operator, location, None).await;
+    IN_FLIGHT_VORTEX_FOOTERS.remove(location);
+    let opened = opened?;
+
+    if let Some(cache) = CacheManager::instance().get_vortex_footer_cache() {
+        cache.insert(location.to_string(), opened.file.footer().clone());
+    }
+
+    Ok(opened)
+}
+
+fn get_cached_vortex_footer(location: &str) -> Option<Footer> {
+    CacheManager::instance()
+        .get_vortex_footer_cache()
+        .and_then(|cache| cache.get(location).map(|footer| footer.as_ref().clone()))
+}
+
+fn get_cached_vortex_footer_without_miss(location: &str) -> Option<Footer> {
+    let cache = CacheManager::instance().get_vortex_footer_cache()?;
+    if !cache.contains_key(location) {
+        return None;
+    }
+
+    cache.get(location).map(|footer| footer.as_ref().clone())
+}
+
+async fn open_vortex_file_with_footer_async(
+    operator: opendal::Operator,
+    location: &str,
+    footer: Option<Footer>,
+) -> Result<OpenedVortexFile> {
     let handle = vortex_handle();
     let session = VortexSession::default().with_handle(handle);
     let session_for_open = session.clone();
@@ -282,16 +337,15 @@ pub(crate) async fn open_vortex_file_async(
             "FUSE storage_format='vortex' failed to build read_at for {location}: {e}"
         ))
     })?;
-    let file = session_for_open
-        .open_options()
-        .with_initial_read_size(0)
-        .open_read_at(read_at)
-        .await
-        .map_err(|e| {
-            ErrorCode::BadBytes(format!(
-                "FUSE storage_format='vortex' failed to open Vortex file via read_at: {e}"
-            ))
-        })?;
+    let mut open_options = session_for_open.open_options().with_initial_read_size(0);
+    if let Some(footer) = footer {
+        open_options = open_options.with_footer(footer);
+    }
+    let file = open_options.open_read_at(read_at).await.map_err(|e| {
+        ErrorCode::BadBytes(format!(
+            "FUSE storage_format='vortex' failed to open Vortex file via read_at: {e}"
+        ))
+    })?;
 
     Ok(OpenedVortexFile {
         file,

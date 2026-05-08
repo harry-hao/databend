@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use arrow::array::ArrayRef;
 use databend_common_cache::MemSized;
+use vortex::file::Footer;
 
 use crate::CacheAccessor;
 use crate::InMemoryLruCache;
@@ -64,6 +65,9 @@ pub type VirtualColumnMetaCache = HybridCache<VirtualColumnFileMeta>;
 
 /// In memory object cache of parquet FileMetaData of external parquet rs files
 pub type ParquetMetaDataCache = InMemoryLruCache<ParquetMetaData>;
+
+/// In memory object cache of Vortex Footer.
+pub type VortexFooterCache = InMemoryLruCache<Footer>;
 
 pub type PrunePartitionsCache = InMemoryLruCache<(PartStatistics, Partitions)>;
 
@@ -343,6 +347,15 @@ impl From<VirtualColumnFileMeta> for CacheValue<VirtualColumnFileMeta> {
 
 impl From<ParquetMetaData> for CacheValue<ParquetMetaData> {
     fn from(value: ParquetMetaData) -> Self {
+        CacheValue {
+            inner: Arc::new(value),
+            mem_bytes: 0,
+        }
+    }
+}
+
+impl From<Footer> for CacheValue<Footer> {
+    fn from(value: Footer) -> Self {
         CacheValue {
             inner: Arc::new(value),
             mem_bytes: 0,

@@ -92,6 +92,7 @@ impl SyncSystemTable for CachesTable {
         let virtual_column_meta_cache = cache_manager.get_virtual_column_meta_cache();
         let prune_partitions_cache = cache_manager.get_prune_partitions_cache();
         let parquet_meta_data_cache = cache_manager.get_parquet_meta_data_cache();
+        let vortex_footer_cache = cache_manager.get_vortex_footer_cache();
         let column_data_cache = cache_manager.get_column_data_cache();
         let table_column_array_cache = cache_manager.get_table_data_array_cache();
         let iceberg_table_cache = cache_manager.get_iceberg_table_cache();
@@ -187,6 +188,10 @@ impl SyncSystemTable for CachesTable {
 
         if let Some(parquet_meta_data_cache) = parquet_meta_data_cache {
             Self::append_row(&parquet_meta_data_cache, &local_node, &mut columns);
+        }
+
+        if let Some(vortex_footer_cache) = vortex_footer_cache {
+            Self::append_row(&vortex_footer_cache, &local_node, &mut columns);
         }
 
         if let Some(table_column_array_cache) = table_column_array_cache {

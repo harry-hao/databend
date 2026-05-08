@@ -17,11 +17,15 @@
 use databend_common_catalog::table::Table;
 use databend_common_expression::block_debug::assert_blocks_eq;
 use databend_common_expression::DataBlock;
+use databend_common_metrics::cache::get_cache_hit_count;
+use databend_common_metrics::cache::get_cache_miss_count;
 use databend_common_storages_fuse::io::SegmentsIO;
 use databend_common_storages_fuse::FuseStorageFormat;
 use databend_common_storages_fuse::FuseTable;
 use databend_query::sessions::TableContext;
 use databend_query::test_kits::TestFixture;
+use databend_storages_common_cache::CacheAccessor;
+use databend_storages_common_cache::CacheManager;
 use databend_storages_common_table_meta::meta::ColumnMeta;
 use databend_storages_common_table_meta::meta::SegmentInfo;
 use futures_util::TryStreamExt;
@@ -186,6 +190,52 @@ async fn test_fuse_vortex_filter_pushdown_subset() -> anyhow::Result<()> {
         "+----------+",
     ];
     assert_blocks_eq(expected, &blocks);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fuse_vortex_footer_cache_hits_on_reopen() -> anyhow::Result<()> {
+    let fixture = TestFixture::setup().await?;
+    fixture.create_default_database().await?;
+    let db = fixture.default_db_name();
+
+    let create = format!("create table {db}.t_vortex_cache(a int) storage_format = 'vortex'");
+    let insert = format!("insert into {db}.t_vortex_cache values (1),(2),(3)");
+    let select = format!("select sum(a) from {db}.t_vortex_cache");
+
+    fixture.execute_command(&create).await?;
+    fixture.execute_command(&insert).await?;
+
+    let cache = CacheManager::instance()
+        .get_vortex_footer_cache()
+        .expect("vortex footer cache must be enabled");
+    cache.clear();
+    assert_eq!(cache.len(), 0, "cache should start empty for this test");
+
+    let cache_name = cache.name().to_string();
+    let hit_before = get_cache_hit_count(&cache_name);
+    let miss_before = get_cache_miss_count(&cache_name);
+
+    let first = fixture.execute_query(&select).await?;
+    let first_blocks = first.try_collect::<Vec<DataBlock>>().await?;
+    assert_eq!(first_blocks.len(), 1, "expected one result block on first read");
+    assert_eq!(cache.len(), 1, "first read should populate exactly one footer");
+    assert_eq!(
+        get_cache_miss_count(&cache_name) - miss_before,
+        1,
+        "first open should miss once and populate the cache"
+    );
+
+    let second = fixture.execute_query(&select).await?;
+    let second_blocks = second.try_collect::<Vec<DataBlock>>().await?;
+    assert_eq!(second_blocks.len(), 1, "expected one result block on second read");
+    assert_eq!(cache.len(), 1, "reopen should reuse the same cached footer");
+    assert_eq!(
+        get_cache_hit_count(&cache_name) - hit_before,
+        1,
+        "second open should hit the cached footer"
+    );
 
     Ok(())
 }
