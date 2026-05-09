@@ -281,6 +281,30 @@ pub(crate) fn vortex_row_indices_from_row_selection(selection: &RowSelection) ->
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VortexRemainScanMode {
+    ShortCircuit,
+    Pushdown,
+    FullScanFilter,
+}
+
+pub(crate) fn vortex_remain_scan_mode_from_row_selection(
+    selection: &RowSelection,
+    total_rows: usize,
+    max_selected_ratio: u64,
+) -> VortexRemainScanMode {
+    if selection.selected_rows == 0 || total_rows == 0 {
+        return VortexRemainScanMode::ShortCircuit;
+    }
+
+    let selected_ratio = (selection.selected_rows as u128 * 100) / total_rows as u128;
+    if selected_ratio > max_selected_ratio as u128 {
+        return VortexRemainScanMode::FullScanFilter;
+    }
+
+    VortexRemainScanMode::Pushdown
+}
+
 /// Holds a single opened Vortex block file together with the runtime and session used to open it,
 /// so scan/decode can be performed (once or multiple times) without reopening the underlying file.
 /// Fields are ordered so `file` drops before `_session` and `rt` (declaration-order drop).
@@ -535,5 +559,38 @@ mod tests {
         let indices = vortex_row_indices_from_row_selection(&selection);
 
         assert_eq!(indices, vec![1, 4, 5, 7]);
+    }
+
+    #[test]
+    fn test_vortex_remain_scan_mode_from_row_selection() {
+        fn selection(bits: &[usize], len: usize) -> RowSelection {
+            let mut bitmap = MutableBitmap::from_len_zeroed(len);
+            for bit in bits {
+                bitmap.set(*bit, true);
+            }
+            let bitmap: Bitmap = bitmap.into();
+            RowSelection::from(&bitmap)
+        }
+
+        assert!(matches!(
+            vortex_remain_scan_mode_from_row_selection(&selection(&[], 8), 8, 25),
+            VortexRemainScanMode::ShortCircuit
+        ));
+        assert!(matches!(
+            vortex_remain_scan_mode_from_row_selection(&selection(&[1, 2], 16), 16, 25),
+            VortexRemainScanMode::Pushdown
+        ));
+        assert!(matches!(
+            vortex_remain_scan_mode_from_row_selection(&selection(&[0, 1, 2, 3, 4], 8), 8, 25),
+            VortexRemainScanMode::FullScanFilter
+        ));
+        assert!(matches!(
+            vortex_remain_scan_mode_from_row_selection(&selection(&[0, 1, 2], 10), 10, 20),
+            VortexRemainScanMode::FullScanFilter
+        ));
+        assert!(matches!(
+            vortex_remain_scan_mode_from_row_selection(&selection(&[0, 1, 2], 10), 10, 30),
+            VortexRemainScanMode::Pushdown
+        ));
     }
 }

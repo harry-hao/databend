@@ -44,8 +44,11 @@ use crate::fuse_part::FuseBlockPartInfo;
 use crate::io::BlockReader;
 use crate::io::DataItem;
 use crate::io::RowSelection;
+use crate::io::read::block::VortexRemainScanMode;
+use crate::io::read::block::filter_vortex_record_batch_with_row_selection;
 use crate::io::read::block::open_vortex_file_async;
 use crate::io::read::block::scan_opened_vortex_file_to_record_batch;
+use crate::io::read::block::vortex_remain_scan_mode_from_row_selection;
 use crate::io::read::block::vortex_row_indices_from_row_selection;
 use crate::pruning::ExprBloomFilter;
 
@@ -61,6 +64,7 @@ pub struct ReadState {
     pub remain_reader: Arc<BlockReader>,
     pub filters: Option<Expr>,
     pub runtime_filters: Vec<BloomRuntimeFilterRef>,
+    pub vortex_remain_pushdown_max_selected_ratio: u64,
     pub prewhere_schema: DataSchema,
     pub pre_column_ids: HashSet<ColumnId>,
     pub remain_column_ids: HashSet<ColumnId>,
@@ -132,6 +136,9 @@ impl ReadState {
             remain_reader,
             filters: prewhere_filter,
             runtime_filters,
+            vortex_remain_pushdown_max_selected_ratio: ctx
+                .get_settings()
+                .get_vortex_remain_pushdown_max_selected_ratio()?,
             prewhere_schema,
             pre_column_ids,
             remain_column_ids,
@@ -402,17 +409,49 @@ impl ReadState {
                 )
             })?;
             let projection = self.remain_reader.vortex_field_names_for_scan(None)?;
-            let remain_row_indices = row_selection
+            let scan_mode = row_selection
                 .as_ref()
-                .map(vortex_row_indices_from_row_selection);
-            let record_batch = scan_opened_vortex_file_to_record_batch(
-                opened,
-                "remain",
-                Some(projection),
-                None,
-                remain_row_indices.as_deref(),
-            )
-            .await?;
+                .map(|selection| {
+                    vortex_remain_scan_mode_from_row_selection(
+                        selection,
+                        part.nums_rows,
+                        self.vortex_remain_pushdown_max_selected_ratio,
+                    )
+                })
+                .unwrap_or(VortexRemainScanMode::FullScanFilter);
+            let record_batch = match scan_mode {
+                VortexRemainScanMode::ShortCircuit => unreachable!(
+                    "zero-row remain selection should have returned before remain scan"
+                ),
+                VortexRemainScanMode::Pushdown => {
+                    let remain_row_indices = row_selection
+                        .as_ref()
+                        .map(vortex_row_indices_from_row_selection);
+                    scan_opened_vortex_file_to_record_batch(
+                        opened,
+                        "remain",
+                        Some(projection.clone()),
+                        None,
+                        remain_row_indices.as_deref(),
+                    )
+                    .await?
+                }
+                VortexRemainScanMode::FullScanFilter => {
+                    let record_batch = scan_opened_vortex_file_to_record_batch(
+                        opened,
+                        "remain",
+                        Some(projection),
+                        None,
+                        None,
+                    )
+                    .await?;
+                    if let Some(sel) = row_selection.as_ref() {
+                        filter_vortex_record_batch_with_row_selection(record_batch, sel)?
+                    } else {
+                        record_batch
+                    }
+                }
+            };
             let result_rows = record_batch.num_rows();
             if result_rows > part.nums_rows {
                 return Err(ErrorCode::BadBytes(format!(
