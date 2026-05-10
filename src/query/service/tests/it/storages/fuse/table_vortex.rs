@@ -195,6 +195,40 @@ async fn test_fuse_vortex_filter_pushdown_subset() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_fuse_vortex_partial_filter_pushdown_with_residual() -> anyhow::Result<()> {
+    let fixture = TestFixture::setup().await?;
+    fixture.create_default_database().await?;
+    let db = fixture.default_db_name();
+
+    let create = format!(
+        "create table {db}.t_vortex_partial_pushdown(a int, b int) storage_format = 'vortex'"
+    );
+    let insert = format!(
+        "insert into {db}.t_vortex_partial_pushdown values (1, 10),(2, 20),(2, 200),(3, 30)"
+    );
+    let select = format!(
+        "select sum(b) from {db}.t_vortex_partial_pushdown where a = 2 and b + 1 = 21"
+    );
+
+    fixture.execute_command(&create).await?;
+    fixture.execute_command(&insert).await?;
+
+    let stream = fixture.execute_query(&select).await?;
+    let blocks = stream.try_collect::<Vec<DataBlock>>().await?;
+    assert_eq!(blocks.len(), 1, "expected single aggregation result block");
+    let expected = vec![
+        "+----------+",
+        "| Column 0 |",
+        "+----------+",
+        "| 20       |",
+        "+----------+",
+    ];
+    assert_blocks_eq(expected, &blocks);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_fuse_vortex_footer_cache_hits_on_reopen() -> anyhow::Result<()> {
     let fixture = TestFixture::setup().await?;
     fixture.create_default_database().await?;

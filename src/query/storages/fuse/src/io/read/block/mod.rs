@@ -39,4 +39,5 @@ pub(crate) use vortex_deserialize::VortexRemainScanMode;
 pub(crate) use vortex_deserialize::vortex_remain_scan_mode_from_row_selection;
 pub(crate) use vortex_deserialize::vortex_row_indices_from_row_selection;
 pub use vortex_predicate::referenced_field_names;
+pub use vortex_predicate::split_expr_for_vortex;
 pub use vortex_predicate::translate_expr_to_vortex;

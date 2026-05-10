@@ -38,6 +38,7 @@ pub use read::VirtualBlockReadResult;
 pub use read::VirtualColumnReader;
 pub use read::build_columns_meta;
 pub use read::referenced_field_names;
+pub use read::split_expr_for_vortex;
 pub use read::translate_expr_to_vortex;
 pub use segments::SegmentsIO;
 pub use segments::SerializedSegment;

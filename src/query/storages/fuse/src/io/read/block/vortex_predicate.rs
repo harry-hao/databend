@@ -17,9 +17,11 @@ use std::sync::Arc;
 use databend_common_exception::Result;
 use databend_common_expression::DataSchema;
 use databend_common_expression::Expr;
+use databend_common_expression::FunctionCall;
 use databend_common_expression::Scalar;
 use databend_common_expression::types::DataType;
 use databend_common_expression::types::NumberScalar;
+use vortex::compute::LikeOptions;
 use vortex::dtype::DType;
 use vortex::dtype::ExtDType;
 use vortex::dtype::Nullability;
@@ -28,18 +30,28 @@ use vortex::dtype::datetime::DATE_ID;
 use vortex::dtype::datetime::TemporalMetadata;
 use vortex::dtype::datetime::TimeUnit;
 use vortex::expr::Expression;
+use vortex::expr::Like;
+use vortex::expr::VTableExt;
 use vortex::expr::and;
 use vortex::expr::col;
 use vortex::expr::eq;
 use vortex::expr::gt;
 use vortex::expr::gt_eq;
 use vortex::expr::is_null;
+use vortex::expr::list_contains;
 use vortex::expr::lit;
 use vortex::expr::lt;
 use vortex::expr::lt_eq;
 use vortex::expr::not;
 use vortex::expr::not_eq;
+use vortex::expr::or;
 use vortex::scalar::Scalar as VortexScalar;
+
+#[derive(Debug, Clone)]
+pub struct VortexPredicateSplit {
+    pub scan_filter: Option<Expression>,
+    pub residual_filter: Option<Expr>,
+}
 
 /// Translate a Databend scalar `Expr` into a Vortex [`Expression`] for filter pushdown.
 ///
@@ -50,6 +62,10 @@ use vortex::scalar::Scalar as VortexScalar;
 #[allow(dead_code)]
 pub fn translate_expr_to_vortex(expr: &Expr, schema: &DataSchema) -> Result<Option<Expression>> {
     Ok(translate_expr_to_vortex_inner(expr, schema))
+}
+
+pub fn split_expr_for_vortex(expr: &Expr, schema: &DataSchema) -> Result<VortexPredicateSplit> {
+    Ok(split_expr_for_vortex_inner(expr, schema))
 }
 
 pub fn referenced_field_names(
@@ -81,9 +97,11 @@ fn translate_expr_to_vortex_inner(expr: &Expr, schema: &DataSchema) -> Option<Ex
                     let rhs = translate_expr_to_vortex_inner(rhs, schema)?;
                     Some(and(lhs, rhs))
                 }
-
-                // Explicitly reject OR (even though Vortex supports it) for a conservative phase.
-                ("or" | "or_filters", _) => None,
+                ("or" | "or_filters", [lhs, rhs]) => {
+                    let lhs = translate_expr_to_vortex_inner(lhs, schema)?;
+                    let rhs = translate_expr_to_vortex_inner(rhs, schema)?;
+                    Some(or(lhs, rhs))
+                }
 
                 // Unary null checks.
                 ("is_null", [child]) => {
@@ -115,8 +133,25 @@ fn translate_expr_to_vortex_inner(expr: &Expr, schema: &DataSchema) -> Option<Ex
                     translate_binary_compare(lhs, rhs, schema, gt_eq)
                 }
 
-                // Explicitly reject LIKE / IN and everything else.
-                ("like" | "in", _) => None,
+                ("like", [lhs, rhs]) => {
+                    let lhs = translate_expr_to_vortex_inner(lhs, schema)?;
+                    let rhs = translate_expr_to_vortex_inner(rhs, schema)?;
+                    Some(Like.new_expr(LikeOptions::default(), [lhs, rhs]))
+                }
+                ("in", [value, rest @ ..]) if !rest.is_empty() => {
+                    let value = translate_expr_to_vortex_inner(value, schema)?;
+                    let list_elements = rest
+                        .iter()
+                        .map(vortex_scalar_literal_from_expr)
+                        .collect::<Option<Vec<_>>>()?;
+                    let element_dtype = list_elements.first()?.dtype().clone();
+                    let list = VortexScalar::list(
+                        element_dtype,
+                        list_elements,
+                        Nullability::Nullable,
+                    );
+                    Some(list_contains(lit(list), value))
+                }
                 _ => None,
             }
         }
@@ -139,6 +174,58 @@ where
     let lhs = translate_expr_to_vortex_inner(lhs, schema)?;
     let rhs = translate_expr_to_vortex_inner(rhs, schema)?;
     Some(build(lhs, rhs))
+}
+
+fn split_expr_for_vortex_inner(expr: &Expr, schema: &DataSchema) -> VortexPredicateSplit {
+    if let Expr::FunctionCall(call) = expr {
+        let name = call.function.signature.name.as_str();
+        if matches!(name, "and" | "and_filters") && call.args.len() == 2 {
+            let lhs = split_expr_for_vortex_inner(&call.args[0], schema);
+            let rhs = split_expr_for_vortex_inner(&call.args[1], schema);
+            return VortexPredicateSplit {
+                scan_filter: combine_scan_filters(lhs.scan_filter, rhs.scan_filter),
+                residual_filter: combine_residual_filters(call, lhs.residual_filter, rhs.residual_filter),
+            };
+        }
+    }
+
+    let translated = translate_expr_to_vortex_inner(expr, schema);
+    let residual_filter = translated.is_none().then(|| expr.clone());
+    VortexPredicateSplit {
+        scan_filter: translated,
+        residual_filter,
+    }
+}
+
+fn combine_scan_filters(lhs: Option<Expression>, rhs: Option<Expression>) -> Option<Expression> {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => Some(and(lhs, rhs)),
+        (Some(expr), None) | (None, Some(expr)) => Some(expr),
+        (None, None) => None,
+    }
+}
+
+fn combine_residual_filters(
+    original_call: &FunctionCall,
+    lhs: Option<Expr>,
+    rhs: Option<Expr>,
+) -> Option<Expr> {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => Some(Expr::FunctionCall(FunctionCall {
+            args: vec![lhs, rhs],
+            ..original_call.clone()
+        })),
+        (Some(expr), None) | (None, Some(expr)) => Some(expr),
+        (None, None) => None,
+    }
+}
+
+fn vortex_scalar_literal_from_expr(expr: &Expr) -> Option<VortexScalar> {
+    match expr {
+        Expr::Constant(c) => vortex_scalar_from_databend(&c.scalar, &c.data_type),
+        Expr::Cast(c) => vortex_scalar_literal_from_expr(&c.expr),
+        _ => None,
+    }
 }
 
 fn collect_referenced_field_names(
@@ -278,6 +365,7 @@ fn vortex_dtype_from_databend(ty: &DataType, nullability: Nullability) -> Option
 
 #[cfg(test)]
 mod tests {
+    use databend_common_expression::FunctionCall;
     use databend_common_expression::ColumnRef;
     use databend_common_expression::Constant;
     use databend_common_expression::DataField;
@@ -293,8 +381,16 @@ mod tests {
 
     use super::DATE_ID;
     use super::referenced_field_names;
+    use super::split_expr_for_vortex;
     use super::translate_expr_to_vortex;
     use super::vortex_scalar_from_databend;
+
+    fn function_name(expr: &Expr) -> &str {
+        match expr {
+            Expr::FunctionCall(FunctionCall { function, .. }) => function.signature.name.as_str(),
+            _ => panic!("expected function call, got {expr:?}"),
+        }
+    }
 
     fn col_ref(id: usize, display_name: &str, data_type: DataType) -> Expr {
         Expr::ColumnRef(ColumnRef {
@@ -363,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_or_translates_none() {
+    fn or_translates_some() {
         let schema = schema_ab_i64();
         let a = col_ref(0, "a", DataType::Number(NumberDataType::Int64));
         let b = col_ref(1, "b", DataType::Number(NumberDataType::Int64));
@@ -379,11 +475,13 @@ mod tests {
         .unwrap();
 
         let translated = translate_expr_to_vortex(&expr, &schema).unwrap();
-        assert!(translated.is_none());
+        let translated = translated.expect("expected Some(Expression)");
+        let s = translated.to_string();
+        assert!(s.contains("or"), "expr: {s}");
     }
 
     #[test]
-    fn unsupported_like_translates_none() {
+    fn like_translates_some() {
         // use a string-typed column
         let schema = DataSchema::new(vec![DataField::new("s", DataType::String)]);
         let s = col_ref(0, "s", DataType::String);
@@ -391,7 +489,48 @@ mod tests {
             check_function(None, "like", &[], &[s, lit_str("%x%")], &BUILTIN_FUNCTIONS).unwrap();
 
         let translated = translate_expr_to_vortex(&expr, &schema).unwrap();
-        assert!(translated.is_none());
+        let translated = translated.expect("expected Some(Expression)");
+        let s = translated.to_string();
+        assert!(s.contains("like"), "expr: {s}");
+    }
+
+    #[test]
+    fn split_and_pushes_supported_subtree_and_keeps_residual() {
+        let schema = DataSchema::new(vec![
+            DataField::new("a", DataType::Number(NumberDataType::Int64)),
+            DataField::new("s", DataType::String),
+        ]);
+        let a = col_ref(0, "a", DataType::Number(NumberDataType::Int64));
+        let a_eq_1 = check_function(None, "eq", &[], &[a, lit_i64(1)], &BUILTIN_FUNCTIONS).unwrap();
+        let arithmetic = check_function(
+            None,
+            "plus",
+            &[],
+            &[lit_i64(1), lit_i64(2)],
+            &BUILTIN_FUNCTIONS,
+        )
+        .unwrap();
+        let residual_expr = check_function(
+            None,
+            "eq",
+            &[],
+            &[arithmetic, lit_i64(3)],
+            &BUILTIN_FUNCTIONS,
+        )
+        .unwrap();
+        let expr = check_function(
+            None,
+            "and_filters",
+            &[],
+            &[a_eq_1, residual_expr.clone()],
+            &BUILTIN_FUNCTIONS,
+        )
+        .unwrap();
+
+        let split = split_expr_for_vortex(&expr, &schema).unwrap();
+        assert!(split.scan_filter.is_some());
+        let residual = split.residual_filter.expect("expected residual filter");
+        assert_eq!(function_name(&residual), "eq");
     }
 
     #[test]
@@ -433,7 +572,7 @@ mod tests {
     fn date_literal_ge_translates_some() {
         let schema = DataSchema::new(vec![DataField::new("d", DataType::Date)]);
         let d = col_ref(0, "d", DataType::Date);
-        let expr = check_function(None, "ge", &[], &[d, lit_date(15887)], &BUILTIN_FUNCTIONS)
+        let expr = check_function(None, "gte", &[], &[d, lit_date(15887)], &BUILTIN_FUNCTIONS)
             .unwrap();
 
         let translated = translate_expr_to_vortex(&expr, &schema).unwrap();

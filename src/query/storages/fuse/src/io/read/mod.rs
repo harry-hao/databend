@@ -36,6 +36,7 @@ pub use block::NativeSourceData;
 pub use block::RowSelection;
 pub use block::column_chunks_to_record_batch;
 pub use block::referenced_field_names;
+pub use block::split_expr_for_vortex;
 pub use block::translate_expr_to_vortex;
 pub use bloom::BloomBlockFilterReader;
 pub use inverted_index::InvertedIndexReader;
