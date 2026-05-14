@@ -172,28 +172,6 @@ impl BlockReader {
         .await
     }
 
-    pub fn deserialize_vortex_chunks_with_scan_filter(
-        &self,
-        block_path: &str,
-        num_rows: usize,
-        _column_metas: &HashMap<ColumnId, ColumnMeta>,
-        column_chunks: HashMap<ColumnId, DataItem>,
-        selection: Option<&RowSelection>,
-        scan_filter: Option<Expression>,
-        extra_projection: Option<FieldNames>,
-        row_indices: Option<&[u32]>,
-    ) -> Result<DataBlock> {
-        GlobalIORuntime::instance().block_on(self.deserialize_vortex_chunks_with_scan_filter_async(
-            block_path,
-            num_rows,
-            _column_metas,
-            column_chunks,
-            selection,
-            scan_filter,
-            extra_projection,
-            row_indices,
-        ))
-    }
 
     pub async fn deserialize_vortex_chunks_with_scan_filter_async<'a, 'b, 'c>(
         &self,
