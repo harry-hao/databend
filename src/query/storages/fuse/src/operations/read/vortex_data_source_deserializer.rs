@@ -249,9 +249,16 @@ impl Processor for VortexDeserializeDataTransform {
                                                 ProfileStatisticsName::VortexPredicatePushdownCount,
                                                 1,
                                             );
-                                            let extra = referenced_field_names(
-                                                filter,
-                                                &read_state.prewhere_schema,
+                                            // Only columns referenced by the residual filter need to
+                                            // be included in the projection as extra fields. Columns
+                                            // that appear only in the scan_filter are consumed by
+                                            // Vortex internally during row filtering and do not need
+                                            // to be materialized in the output RecordBatch.
+                                            let extra = split.residual_filter.as_ref().and_then(
+                                                |residual| referenced_field_names(
+                                                    residual,
+                                                    &read_state.prewhere_schema,
+                                                ),
                                             );
                                             let opened = open_vortex_file_async(
                                                 self.block_reader.operator.clone(),
