@@ -236,11 +236,10 @@ fn collect_referenced_field_names(
     match expr {
         Expr::Constant(_) => Some(()),
         Expr::ColumnRef(c) => {
-            let name = schema.fields().get(c.id)?.name();
-            let display = c.display_name.as_str();
-            if is_nested_column_ref(display, name) {
+            if is_nested_data_type(&c.data_type) {
                 return None;
             }
+            let name = schema.fields().get(c.id)?.name();
             out.insert(name.to_string());
             Some(())
         }
@@ -255,42 +254,17 @@ fn collect_referenced_field_names(
     }
 }
 
-fn is_nested_display_name(display_name: &str) -> bool {
-    // Conservative: reject common nested syntaxes and deref notations.
-    display_name.contains('.')
-        || display_name.contains(':')
-        || display_name.contains('[')
-        || display_name.contains(']')
-        || display_name.contains('(')
-        || display_name.contains(')')
-}
-
-fn is_nested_column_ref(display_name: &str, schema_name: &str) -> bool {
-    // Accept common qualified display forms like `table.col` and `table.col (#id)`.
-    // Nested references should still be rejected.
-    let normalized = display_name
-        .split_once(" (#")
-        .map(|(prefix, _)| prefix)
-        .unwrap_or(display_name)
-        .trim();
-
-    if normalized == schema_name {
-        return false;
+fn is_nested_data_type(ty: &DataType) -> bool {
+    match ty {
+        DataType::Tuple(_)
+        | DataType::Array(_)
+        | DataType::Map(_)
+        | DataType::Vector(_)
+        | DataType::EmptyArray
+        | DataType::EmptyMap => true,
+        DataType::Nullable(inner) => is_nested_data_type(inner),
+        _ => false,
     }
-
-    if normalized.ends_with(schema_name) {
-        let prefix_len = normalized.len().saturating_sub(schema_name.len());
-        let prefix = &normalized[..prefix_len];
-        if prefix.ends_with('.') {
-            let qualifier = &prefix[..prefix.len().saturating_sub(1)];
-            // Treat one-identifier qualifier (`table.col` or `alias.col`) as non-nested.
-            if !qualifier.is_empty() && !qualifier.contains('.') {
-                return false;
-            }
-        }
-    }
-
-    is_nested_display_name(normalized)
 }
 
 fn vortex_date_ext_dtype(nullability: Nullability) -> Arc<ExtDType> {
