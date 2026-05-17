@@ -276,15 +276,13 @@ impl VortexRowsFetcher {
             uniq_indices.dedup();
 
             let block = reader
-                .deserialize_vortex_chunks_with_scan_filter_async(
+                .read_block(
                     &metadata.location,
                     metadata.nums_rows,
-                    &metadata.columns_meta,
-                    std::collections::HashMap::new(),
-                    None,
                     None,
                     None,
                     Some(uniq_indices.as_slice()),
+                    None,
                 )
                 .await
                 .map_err(|e| {

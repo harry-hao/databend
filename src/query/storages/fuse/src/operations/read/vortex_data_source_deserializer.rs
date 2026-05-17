@@ -50,8 +50,7 @@ use crate::fuse_part::FuseBlockPartInfo;
 use crate::io::AggIndexReader;
 use crate::io::BlockReader;
 use crate::io::referenced_field_names;
-use crate::io::read::block::open_vortex_file_async;
-use crate::io::read::block::scan_opened_vortex_file_to_record_batch;
+use crate::io::read::block::read_record_batch;
 use crate::io::split_expr_for_vortex;
 use crate::operations::read::data_source_with_meta::DataSourceWithMeta;
 
@@ -238,8 +237,8 @@ impl Processor for VortexDeserializeDataTransform {
 
                     let mut data_block = match &self.read_state {
                         Some(read_state) => {
-                            match (&read_state.filters, read_state.runtime_filters.is_empty()) {
-                                (Some(filter), true) => {
+                            match &read_state.filters {
+                                Some(filter) => {
                                     let split =
                                         split_expr_for_vortex(filter, &read_state.prewhere_schema)?;
 
@@ -260,17 +259,14 @@ impl Processor for VortexDeserializeDataTransform {
                                                     &read_state.prewhere_schema,
                                                 ),
                                             );
-                                            let opened = open_vortex_file_async(
-                                                self.block_reader.operator.clone(),
-                                                &fuse_part.location,
-                                            )
-                                            .await?;
+                                            let opened = self.block_reader
+                                                .open_block(&fuse_part.location)
+                                                .await?;
                                             let projection =
-                                                self.block_reader.vortex_field_names_for_scan(extra)?;
+                                                self.block_reader.projection_field_names(extra)?;
                                             let record_batch =
-                                                scan_opened_vortex_file_to_record_batch(
+                                                read_record_batch(
                                                     &opened,
-                                                    "single",
                                                     Some(projection),
                                                     Some(vortex_filter),
                                                     None,
@@ -278,13 +274,13 @@ impl Processor for VortexDeserializeDataTransform {
                                                 .await?;
                                             let mut data_block = self
                                                 .block_reader
-                                                .map_vortex_record_batch_to_data_block(&record_batch)?;
+                                                .record_batch_to_block(&record_batch)?;
                                             if let Some(residual_filter) =
                                                 split.residual_filter.as_ref()
                                             {
                                                 let prewhere_block = read_state
                                                     .pre_reader
-                                                    .map_vortex_record_batch_to_data_block(
+                                                    .record_batch_to_block(
                                                         &record_batch,
                                                     )?;
                                                 let bitmap = filter_bitmap_for_expr(
@@ -296,29 +292,38 @@ impl Processor for VortexDeserializeDataTransform {
                                             }
                                             data_block
                                         }
+                                        // The filter exists but cannot be pushed into Vortex;
+                                        // fall back to Databend-side prewhere filtering.
                                         None => {
-                                            let (data_block, _row_selection, _bitmap) = read_state
+                                            read_state
                                                 .deserialize_and_filter_vortex_async(&fuse_part)
-                                                .await?;
-                                            data_block
+                                                .await?
                                         }
                                     }
                                 }
-                                _ => {
-                                    let (data_block, _row_selection, _bitmap) = read_state
-                                        .deserialize_and_filter_vortex_async(&fuse_part)
-                                        .await?;
-                                    data_block
+                                // No prewhere filter: read the full projection without filtering.
+                                None => {
+                                    self.block_reader
+                                        .read_block(
+                                            &fuse_part.location,
+                                            fuse_part.nums_rows,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                        )
+                                        .await?
                                 }
                             }
                         }
                         None => {
                             self.block_reader
-                                .deserialize_vortex_chunks_async(
+                                .read_block(
                                     &fuse_part.location,
                                     fuse_part.nums_rows,
-                                    &fuse_part.columns_meta,
-                                    std::collections::HashMap::new(),
+                                    None,
+                                    None,
+                                    None,
                                     None,
                                 )
                                 .await?
