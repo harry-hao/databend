@@ -45,11 +45,10 @@ use crate::io::BlockReader;
 use crate::io::DataItem;
 use crate::io::RowSelection;
 use crate::io::read::block::VortexRemainScanMode;
-use crate::io::read::block::filter_vortex_record_batch_with_row_selection;
-use crate::io::read::block::open_vortex_file_async;
-use crate::io::read::block::scan_opened_vortex_file_to_record_batch;
-use crate::io::read::block::vortex_remain_scan_mode_from_row_selection;
-use crate::io::read::block::vortex_row_indices_from_row_selection;
+use crate::io::read::block::apply_row_selection;
+use crate::io::read::block::read_record_batch;
+use crate::io::read::block::remain_scan_mode;
+use crate::io::read::block::row_selection_to_indices;
 use crate::pruning::ExprBloomFilter;
 
 #[derive(Clone)]
@@ -236,13 +235,6 @@ impl ReadState {
         Ok((data_block, row_selection, bitmap_selection))
     }
 
-    pub fn deserialize_and_filter_vortex(
-        &self,
-        part: &FuseBlockPartInfo,
-    ) -> Result<(DataBlock, Option<RowSelection>, Option<Bitmap>)> {
-        GlobalIORuntime::instance().block_on(self.deserialize_and_filter_vortex_async(part))
-    }
-
     pub async fn deserialize_and_filter_vortex_async(
         &self,
         part: &FuseBlockPartInfo,
@@ -251,7 +243,7 @@ impl ReadState {
         let remain_fields_empty = self.remain_reader.projected_schema.fields.is_empty();
         let _ = (pre_fields_empty, remain_fields_empty);
 
-        // Match `deserialize_vortex_chunks_with_scan_filter`: do not open or scan the Vortex file
+        // Match `read_block`: do not open or scan the Vortex file
         // when `result_rows == 0`; build empty pre/remain blocks with correct schemas, then apply
         // the same filter/merge path as the non-zero case (without I/O).
         if part.nums_rows == 0 {
@@ -313,7 +305,7 @@ impl ReadState {
         // operator denotes the same storage backend for `part.location` (we open once with
         // `pre_reader.operator` even when only the remain side needs a scan).
         let opened_opt = if !pre_fields_empty || !remain_fields_empty {
-            Some(open_vortex_file_async(self.pre_reader.operator.clone(), &part.location).await?)
+            Some(self.pre_reader.open_block(&part.location).await?)
         } else {
             None
         };
@@ -326,10 +318,9 @@ impl ReadState {
                     "Vortex ReadState: missing opened file for prewhere read".to_string(),
                 )
             })?;
-            let projection = self.pre_reader.vortex_field_names_for_scan(None)?;
-            let record_batch = scan_opened_vortex_file_to_record_batch(
+            let projection = self.pre_reader.projection_field_names(None)?;
+            let record_batch = read_record_batch(
                 opened,
-                "prewhere",
                 Some(projection),
                 None,
                 None,
@@ -343,7 +334,7 @@ impl ReadState {
                 )));
             }
             self.pre_reader
-                .map_vortex_record_batch_to_data_block(&record_batch)?
+                .record_batch_to_block(&record_batch)?
         };
 
         let filter_bitmap = self.filter(&preread_block, part.nums_rows)?;
@@ -408,11 +399,11 @@ impl ReadState {
                     "Vortex ReadState: missing opened file for remain columns".to_string(),
                 )
             })?;
-            let projection = self.remain_reader.vortex_field_names_for_scan(None)?;
+            let projection = self.remain_reader.projection_field_names(None)?;
             let scan_mode = row_selection
                 .as_ref()
                 .map(|selection| {
-                    vortex_remain_scan_mode_from_row_selection(
+                    remain_scan_mode(
                         selection,
                         part.nums_rows,
                         self.vortex_remain_pushdown_max_selected_ratio,
@@ -426,10 +417,9 @@ impl ReadState {
                 VortexRemainScanMode::Pushdown => {
                     let remain_row_indices = row_selection
                         .as_ref()
-                        .map(vortex_row_indices_from_row_selection);
-                    scan_opened_vortex_file_to_record_batch(
+                        .map(row_selection_to_indices);
+                    read_record_batch(
                         opened,
-                        "remain",
                         Some(projection.clone()),
                         None,
                         remain_row_indices.as_deref(),
@@ -437,16 +427,15 @@ impl ReadState {
                     .await?
                 }
                 VortexRemainScanMode::FullScanFilter => {
-                    let record_batch = scan_opened_vortex_file_to_record_batch(
+                    let record_batch = read_record_batch(
                         opened,
-                        "remain",
                         Some(projection),
                         None,
                         None,
                     )
                     .await?;
                     if let Some(sel) = row_selection.as_ref() {
-                        filter_vortex_record_batch_with_row_selection(record_batch, sel)?
+                        apply_row_selection(record_batch, sel)?
                     } else {
                         record_batch
                     }
@@ -460,7 +449,7 @@ impl ReadState {
                 )));
             }
             self.remain_reader
-                .map_vortex_record_batch_to_data_block(&record_batch)
+                .record_batch_to_block(&record_batch)
                 .map_err(|e| {
                     ErrorCode::Internal(format!(
                         "Vortex remain stage failed for {}: {}",
