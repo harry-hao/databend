@@ -286,17 +286,14 @@ impl ReadState {
         let filter_bitmap = self.filter(&preread_block, part.nums_rows)?;
         let bitmap_selection: Option<Bitmap> = filter_bitmap.map(Into::into);
 
-        if let Some(ref bitmap) = bitmap_selection
-            && bitmap.len() != part.nums_rows
-        {
-            return Err(ErrorCode::Internal(format!(
-                "Vortex ReadState bitmap length mismatch: expected {}, got {}",
-                part.nums_rows,
-                bitmap.len()
-            )));
-        }
-
         if let Some(ref bitmap) = bitmap_selection {
+            if bitmap.len() != part.nums_rows {
+                return Err(ErrorCode::Internal(format!(
+                    "Vortex ReadState bitmap length mismatch: expected {}, got {}",
+                    part.nums_rows,
+                    bitmap.len()
+                )));
+            }
             preread_block = preread_block.filter_with_bitmap(bitmap)?;
         }
 
@@ -336,6 +333,12 @@ impl ReadState {
                 )
             })?;
             let projection = self.remain_reader.projection_field_names(None)?;
+            // Choose remain scan strategy based on selectivity:
+            // - Pushdown: few rows selected → pass row indices directly to Vortex so it skips
+            //   non-selected rows during I/O (avoids reading + decoding unused data).
+            // - FullScanFilter: most rows selected → reading the full column and applying a
+            //   bitmap post-scan is cheaper than the overhead of random-access index seeks.
+            // - row_selection=None means no prewhere filter → full scan, no post-filter needed.
             let scan_mode = row_selection
                 .as_ref()
                 .map(|selection| {
