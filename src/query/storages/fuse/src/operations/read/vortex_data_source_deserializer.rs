@@ -84,6 +84,7 @@ pub struct VortexDeserializeDataTransform {
 
     base_block_ids: Option<Scalar>,
     need_reserve_block_info: bool,
+    vortex_remain_pushdown_max_selected_ratio: u64,
 
     read_state: Option<ReadState>,
 }
@@ -126,6 +127,9 @@ impl VortexDeserializeDataTransform {
             };
 
         let (need_reserve_block_info, _) = need_reserve_block_info(ctx.clone(), plan.table_index);
+        let vortex_remain_pushdown_max_selected_ratio = ctx
+            .get_settings()
+            .get_vortex_remain_pushdown_max_selected_ratio()?;
         Ok(ProcessorPtr::create(Box::new(
             VortexDeserializeDataTransform {
                 ctx: ctx.clone(),
@@ -142,6 +146,7 @@ impl VortexDeserializeDataTransform {
                 chunks: vec![],
                 base_block_ids: plan.base_block_ids.clone(),
                 need_reserve_block_info,
+                vortex_remain_pushdown_max_selected_ratio,
                 read_state,
             },
         )))
@@ -296,7 +301,10 @@ impl Processor for VortexDeserializeDataTransform {
                                         // fall back to Databend-side prewhere filtering.
                                         None => {
                                             read_state
-                                                .deserialize_and_filter_vortex_async(&fuse_part)
+                                                .deserialize_and_filter_vortex_async(
+                                                    &fuse_part,
+                                                    self.vortex_remain_pushdown_max_selected_ratio,
+                                                )
                                                 .await?
                                         }
                                     }

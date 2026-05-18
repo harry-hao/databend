@@ -233,7 +233,6 @@ pub(crate) fn row_selection_to_indices(selection: &RowSelection) -> Vec<u32> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VortexRemainScanMode {
-    ShortCircuit,
     Pushdown,
     FullScanFilter,
 }
@@ -244,9 +243,10 @@ pub(crate) fn remain_scan_mode(
     total_rows: usize,
     max_selected_ratio: u64,
 ) -> VortexRemainScanMode {
-    if selection.selected_rows == 0 || total_rows == 0 {
-        return VortexRemainScanMode::ShortCircuit;
-    }
+    debug_assert!(
+        selection.selected_rows > 0 && total_rows > 0,
+        "zero-row selection must be handled before calling this function"
+    );
 
     let selected_ratio = (selection.selected_rows as u128 * 100) / total_rows as u128;
     if selected_ratio > max_selected_ratio as u128 {
@@ -481,10 +481,6 @@ mod tests {
             RowSelection::from(&bitmap)
         }
 
-        assert!(matches!(
-            remain_scan_mode(&selection(&[], 8), 8, 25),
-            VortexRemainScanMode::ShortCircuit
-        ));
         assert!(matches!(
             remain_scan_mode(&selection(&[1, 2], 16), 16, 25),
             VortexRemainScanMode::Pushdown

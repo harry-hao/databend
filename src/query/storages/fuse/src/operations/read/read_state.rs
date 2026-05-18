@@ -63,7 +63,6 @@ pub struct ReadState {
     pub remain_reader: Arc<BlockReader>,
     pub filters: Option<Expr>,
     pub runtime_filters: Vec<BloomRuntimeFilterRef>,
-    pub vortex_remain_pushdown_max_selected_ratio: u64,
     pub prewhere_schema: DataSchema,
     pub pre_column_ids: HashSet<ColumnId>,
     pub remain_column_ids: HashSet<ColumnId>,
@@ -135,9 +134,6 @@ impl ReadState {
             remain_reader,
             filters: prewhere_filter,
             runtime_filters,
-            vortex_remain_pushdown_max_selected_ratio: ctx
-                .get_settings()
-                .get_vortex_remain_pushdown_max_selected_ratio()?,
             prewhere_schema,
             pre_column_ids,
             remain_column_ids,
@@ -238,6 +234,7 @@ impl ReadState {
     pub async fn deserialize_and_filter_vortex_async(
         &self,
         part: &FuseBlockPartInfo,
+        remain_pushdown_max_selected_ratio: u64,
     ) -> Result<DataBlock> {
         let pre_fields_empty = self.pre_reader.projected_schema.fields.is_empty();
         let remain_fields_empty = self.remain_reader.projected_schema.fields.is_empty();
@@ -345,14 +342,11 @@ impl ReadState {
                     remain_scan_mode(
                         selection,
                         part.nums_rows,
-                        self.vortex_remain_pushdown_max_selected_ratio,
+                        remain_pushdown_max_selected_ratio,
                     )
                 })
                 .unwrap_or(VortexRemainScanMode::FullScanFilter);
             let record_batch = match scan_mode {
-                VortexRemainScanMode::ShortCircuit => unreachable!(
-                    "zero-row remain selection should have returned before remain scan"
-                ),
                 VortexRemainScanMode::Pushdown => {
                     let remain_row_indices = row_selection
                         .as_ref()
