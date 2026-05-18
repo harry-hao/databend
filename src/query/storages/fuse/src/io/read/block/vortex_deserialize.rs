@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -27,16 +26,12 @@ use databend_common_column::bitmap::utils::SlicesIterator;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::BlockEntry;
-use databend_common_expression::ColumnId;
 use databend_common_expression::DataBlock;
-use databend_common_expression::TableDataType;
-use databend_common_expression::TableSchema;
 use databend_common_expression::Value;
 use databend_common_expression::types::Bitmap;
 use databend_common_metrics::storage::metrics_inc_remote_io_read_parts;
 use databend_storages_common_cache::CacheAccessor;
 use databend_storages_common_cache::CacheManager;
-use databend_storages_common_table_meta::meta::ColumnMeta;
 use futures_util::StreamExt;
 use futures_util::pin_mut;
 use tokio::sync::Mutex;
@@ -59,7 +54,6 @@ use vortex::stream::ArrayStream;
 use super::parquet::RowSelection;
 use super::vortex_read_at::OpendalReadAt;
 use crate::io::BlockReader;
-use crate::io::read::block::block_reader_merge_io::DataItem;
 use crate::io::vortex_runtime::vortex_handle;
 
 static IN_FLIGHT_VORTEX_FOOTERS: LazyLock<DashMap<String, Arc<Mutex<()>>>> =

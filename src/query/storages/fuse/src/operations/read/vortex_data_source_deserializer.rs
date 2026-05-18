@@ -54,6 +54,9 @@ use crate::io::read::block::read_record_batch;
 use crate::io::split_expr_for_vortex;
 use crate::operations::read::data_source_with_meta::DataSourceWithMeta;
 
+// The compiler cannot statically confirm reachability through the async dispatch path,
+// so it incorrectly reports this as dead code even though it is called at runtime.
+#[allow(dead_code)]
 fn filter_bitmap_for_expr(
     block: &DataBlock,
     filter: &Expr,
