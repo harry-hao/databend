@@ -182,6 +182,9 @@ spill_local_disk_path = "./.databend/temp/_query_spill"
 # Cap local spill to 5GB so window spills keep ~1GB quota with default 20% ratio.
 spill_local_disk_max_bytes = 1073741824
 window_partition_spilling_disk_quota_ratio = 20
+
+[settings]
+vortex_remain_pushdown_max_selected_ratio = 50
 """
 
 QUERIES_DIR = "benchmark/hits/queries"
