@@ -52,7 +52,7 @@ use vortex::session::VortexSession;
 use vortex::stream::ArrayStream;
 
 use super::parquet::RowSelection;
-use super::vortex_read_at::OpendalReadAt;
+use super::vortex_read_at::OpendalReadSource;
 use crate::io::BlockReader;
 use crate::io::vortex_runtime::vortex_handle;
 
@@ -310,21 +310,16 @@ async fn open_vortex_block_with_footer(
     location: &str,
     footer: Option<Footer>,
 ) -> Result<VortexBlock> {
-    let handle = vortex_handle();
-    let session = VortexSession::default().with_handle(handle);
+    let session = VortexSession::default().with_handle(vortex_handle());
     let session_for_open = session.clone();
-    let read_at = OpendalReadAt::open(operator, location).await.map_err(|e| {
-        ErrorCode::BadBytes(format!(
-            "FUSE storage_format='vortex' failed to build read_at for {location}: {e}"
-        ))
-    })?;
+    let source = OpendalReadSource::new(operator, location);
     let mut open_options = session_for_open.open_options().with_initial_read_size(0);
     if let Some(footer) = footer {
         open_options = open_options.with_footer(footer);
     }
-    let file = open_options.open_read_at(read_at).await.map_err(|e| {
+    let file = open_options.open(source).await.map_err(|e| {
         ErrorCode::BadBytes(format!(
-            "FUSE storage_format='vortex' failed to open Vortex file via read_at: {e}"
+            "FUSE storage_format='vortex' failed to open Vortex file: {e}"
         ))
     })?;
 
