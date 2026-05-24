@@ -20,6 +20,7 @@ mod native_data_source_deserializer;
 mod parquet_data_source;
 mod parquet_data_source_deserializer;
 mod parquet_rows_fetcher;
+mod vortex_rows_fetcher;
 mod vortex_data_source;
 mod vortex_data_source_deserializer;
 mod raw_data_source;

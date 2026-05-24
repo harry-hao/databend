@@ -234,17 +234,53 @@ impl ReadState {
     ) -> Result<(DataBlock, Option<RowSelection>, Option<Bitmap>)> {
         let pre_fields_empty = self.pre_reader.projected_schema.fields.is_empty();
         let remain_fields_empty = self.remain_reader.projected_schema.fields.is_empty();
+        let _ = (pre_fields_empty, remain_fields_empty);
 
-        // Match `deserialize_vortex_chunks_with_scan_filter`: when `result_rows == 0`, return
-        // empty blocks without opening or scanning the file (no prewhere/runtime filter pass).
+        // Match `deserialize_vortex_chunks_with_scan_filter`: do not open or scan the Vortex file
+        // when `result_rows == 0`; build empty pre/remain blocks with correct schemas, then apply
+        // the same filter/merge path as the non-zero case (without I/O).
         if part.nums_rows == 0 {
             let mut preread_block = if pre_fields_empty {
                 DataBlock::empty_with_rows(0)
             } else {
                 DataBlock::empty_with_schema(&self.pre_reader.data_schema())
             };
+
+            let filter_bitmap = self.filter(&preread_block, 0)?;
+            let runtime_filter_bitmap = self.runtime_filter(&preread_block, 0)?;
+
+            let bitmap_selection: Option<Bitmap> = match (filter_bitmap, runtime_filter_bitmap) {
+                (Some(filter_bitmap), Some(runtime_filter_bitmap)) => {
+                    let rhs: Bitmap = runtime_filter_bitmap.into();
+                    Some((filter_bitmap & &rhs).into())
+                }
+                (Some(filter_bitmap), None) => Some(filter_bitmap.into()),
+                (None, Some(runtime_filter_bitmap)) => Some(runtime_filter_bitmap.into()),
+                (None, None) => None,
+            };
+
+            if let Some(ref bitmap) = bitmap_selection
+                && bitmap.len() != part.nums_rows
+            {
+                return Err(ErrorCode::Internal(format!(
+                    "Vortex ReadState bitmap length mismatch: expected {}, got {}",
+                    part.nums_rows,
+                    bitmap.len()
+                )));
+            }
+
+            if let Some(ref bitmap) = bitmap_selection {
+                preread_block = preread_block.filter_with_bitmap(bitmap)?;
+            }
+
+            let row_selection = bitmap_selection.as_ref().map(RowSelection::from);
+
             let remain_block = if remain_fields_empty {
-                DataBlock::empty_with_rows(0)
+                let result_rows = row_selection
+                    .as_ref()
+                    .map(|s| s.selected_rows)
+                    .unwrap_or(0);
+                DataBlock::empty_with_rows(result_rows)
             } else {
                 DataBlock::empty_with_schema(&self.remain_reader.data_schema())
             };
@@ -257,7 +293,7 @@ impl ReadState {
 
             let data_block = preread_block.resort(&merged_schema, &self.output_schema)?;
 
-            return Ok((data_block, None, None));
+            return Ok((data_block, row_selection, bitmap_selection));
         }
 
         // `pre_reader` and `remain_reader` are both `BlockReader::change_projection` views of the
@@ -284,7 +320,9 @@ impl ReadState {
             let projection = self.pre_reader.vortex_field_names_for_scan(None)?;
             let record_batch = scan_opened_vortex_file_to_record_batch(
                 opened,
+                "prewhere",
                 Some(projection),
+                None,
                 None,
             )?;
             let result_rows = record_batch.num_rows();
@@ -326,6 +364,26 @@ impl ReadState {
         }
 
         let row_selection = bitmap_selection.as_ref().map(RowSelection::from);
+        if row_selection.as_ref().is_some_and(|s| s.selected_rows == 0) {
+            // If prewhere/runtime filters select zero rows, avoid the remain-stage scan entirely.
+            // This is both a performance win and prevents downstream type mismatches when mapping
+            // an empty filtered RecordBatch into non-nullable columns.
+            let remain_block = if remain_fields_empty {
+                DataBlock::empty_with_rows(0)
+            } else {
+                DataBlock::empty_with_schema(&self.remain_reader.data_schema())
+            };
+
+            let mut merged_fields = self.pre_reader.data_fields();
+            merged_fields.extend(self.remain_reader.data_fields());
+            let merged_schema = DataSchema::new(merged_fields);
+
+            preread_block.merge_block(remain_block);
+
+            let data_block = preread_block.resort(&merged_schema, &self.output_schema)?;
+
+            return Ok((data_block, row_selection, bitmap_selection));
+        }
 
         let remain_block = if remain_fields_empty {
             let result_rows = row_selection
@@ -342,7 +400,9 @@ impl ReadState {
             let projection = self.remain_reader.vortex_field_names_for_scan(None)?;
             let mut record_batch = scan_opened_vortex_file_to_record_batch(
                 opened,
+                "remain",
                 Some(projection),
+                None,
                 None,
             )?;
             let result_rows = record_batch.num_rows();
@@ -357,7 +417,13 @@ impl ReadState {
                     filter_vortex_record_batch_with_row_selection(record_batch, sel)?;
             }
             self.remain_reader
-                .map_vortex_record_batch_to_data_block(&record_batch)?
+                .map_vortex_record_batch_to_data_block(&record_batch)
+                .map_err(|e| {
+                    ErrorCode::Internal(format!(
+                        "Vortex remain stage failed for {}: {}",
+                        part.location, e
+                    ))
+                })?
         };
 
         let mut merged_fields = self.pre_reader.data_fields();

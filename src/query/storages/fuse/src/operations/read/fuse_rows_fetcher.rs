@@ -39,10 +39,46 @@ use databend_common_pipeline::core::ProcessorPtr;
 use databend_storages_common_io::ReadSettings;
 
 use super::parquet_rows_fetcher::ParquetRowsFetcher;
+use super::vortex_rows_fetcher::VortexRowsFetcher;
 use crate::FuseStorageFormat;
 use crate::FuseTable;
 
 type RowFetcher = Box<dyn Fn(Arc<InputPort>, Arc<OutputPort>) -> Result<ProcessorPtr>>;
+
+enum AnyRowsFetcher {
+    Parquet(ParquetRowsFetcher),
+    Vortex(VortexRowsFetcher),
+}
+
+#[async_trait::async_trait]
+impl RowsFetcher for AnyRowsFetcher {
+    type Metadata = Arc<super::parquet_rows_fetcher::RowsFetchMetadataImpl>;
+
+    async fn initialize(&mut self) -> Result<()> {
+        match self {
+            AnyRowsFetcher::Parquet(f) => f.initialize().await,
+            AnyRowsFetcher::Vortex(f) => f.initialize().await,
+        }
+    }
+
+    async fn fetch_metadata(&mut self, block_id: u64) -> Result<Self::Metadata> {
+        match self {
+            AnyRowsFetcher::Parquet(f) => f.fetch_metadata(block_id).await,
+            AnyRowsFetcher::Vortex(f) => f.fetch_metadata(block_id).await,
+        }
+    }
+
+    async fn fetch(
+        &mut self,
+        row_ids: &[u64],
+        metadata: HashMap<u64, Self::Metadata>,
+    ) -> Result<DataBlock> {
+        match self {
+            AnyRowsFetcher::Parquet(f) => f.fetch(row_ids, metadata).await,
+            AnyRowsFetcher::Vortex(f) => f.fetch(row_ids, metadata).await,
+        }
+    }
+}
 
 pub fn row_fetch_processor(
     ctx: Arc<dyn TableContext>,
@@ -80,16 +116,25 @@ pub fn row_fetch_processor(
             };
 
             Ok(Box::new(move |input, output| {
-                Ok(TransformRowsFetcher::create(
-                    input,
-                    output,
-                    row_id_col_offset,
-                    ParquetRowsFetcher::create(
+                let fetcher: AnyRowsFetcher = match &fuse_table.storage_format {
+                    FuseStorageFormat::Parquet => AnyRowsFetcher::Parquet(ParquetRowsFetcher::create(
                         fuse_table.clone(),
                         projection.clone(),
                         block_reader.clone(),
                         read_settings,
-                    ),
+                    )),
+                    FuseStorageFormat::Vortex => AnyRowsFetcher::Vortex(VortexRowsFetcher::create(
+                        fuse_table.clone(),
+                        block_reader.clone(),
+                        read_settings,
+                    )),
+                    FuseStorageFormat::Native => unreachable!(),
+                };
+                Ok(TransformRowsFetcher::create(
+                    input,
+                    output,
+                    row_id_col_offset,
+                    fetcher,
                     need_wrap_nullable,
                     fetched_data_types.clone(),
                     block_threshold,
