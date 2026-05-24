@@ -372,6 +372,10 @@ impl Settings {
         self.try_get_u64("spatial_runtime_filter_threshold")
     }
 
+    pub fn get_vortex_remain_pushdown_max_selected_ratio(&self) -> Result<u64> {
+        self.try_get_u64("vortex_remain_pushdown_max_selected_ratio")
+    }
+
     pub fn get_unquoted_ident_case_sensitive(&self) -> Result<bool> {
         Ok(self.try_get_u64("unquoted_ident_case_sensitive")? != 0)
     }

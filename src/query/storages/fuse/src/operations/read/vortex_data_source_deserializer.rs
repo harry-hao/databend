@@ -27,6 +27,11 @@ use databend_common_exception::Result;
 use databend_common_expression::BlockMetaInfoDowncast;
 use databend_common_expression::DataBlock;
 use databend_common_expression::DataSchema;
+use databend_common_expression::Evaluator;
+use databend_common_expression::Expr;
+use databend_common_expression::FunctionContext;
+use databend_common_expression::filter_helper::FilterHelpers;
+use databend_common_expression::types::Bitmap;
 use databend_common_expression::Scalar;
 use databend_common_metrics::storage::*;
 use databend_common_pipeline::core::Event;
@@ -34,6 +39,7 @@ use databend_common_pipeline::core::InputPort;
 use databend_common_pipeline::core::OutputPort;
 use databend_common_pipeline::core::Processor;
 use databend_common_pipeline::core::ProcessorPtr;
+use databend_common_functions::BUILTIN_FUNCTIONS;
 
 use super::read_data_source::ReadDataSource;
 use super::read_state::ReadState;
@@ -43,7 +49,21 @@ use super::vortex_data_source::VortexDataSource;
 use crate::fuse_part::FuseBlockPartInfo;
 use crate::io::AggIndexReader;
 use crate::io::BlockReader;
+use crate::io::referenced_field_names;
+use crate::io::read::block::open_vortex_file_async;
+use crate::io::read::block::scan_opened_vortex_file_to_record_batch;
+use crate::io::split_expr_for_vortex;
 use crate::operations::read::data_source_with_meta::DataSourceWithMeta;
+
+fn filter_bitmap_for_expr(
+    block: &DataBlock,
+    filter: &Expr,
+    func_ctx: &FunctionContext,
+) -> Result<Bitmap> {
+    let evaluator = Evaluator::new(block, func_ctx, &BUILTIN_FUNCTIONS);
+    let filter_result = FilterHelpers::decode_predicate(evaluator.run(filter)?);
+    Ok(FilterHelpers::filter_to_bitmap(filter_result, block.num_rows()).into())
+}
 
 pub struct VortexDeserializeDataTransform {
     // Kept for parity with parquet/native deserializers (prewhere / runtime filters evolution).
@@ -94,37 +114,38 @@ impl VortexDeserializeDataTransform {
             .and_then(|p| p.prewhere.as_ref())
             .cloned();
 
-        let read_state = if prewhere_info.is_some()
-            || !ctx.get_runtime_filters(plan.scan_id).is_empty()
-        {
-            Some(ReadState::create(
-                ctx.clone(),
-                plan.scan_id,
-                prewhere_info.as_ref(),
-                block_reader.as_ref(),
-            )?)
-        } else {
-            None
-        };
+        let read_state =
+            if prewhere_info.is_some() || !ctx.get_runtime_filters(plan.scan_id).is_empty() {
+                Some(ReadState::create(
+                    ctx.clone(),
+                    plan.scan_id,
+                    prewhere_info.as_ref(),
+                    block_reader.as_ref(),
+                )?)
+            } else {
+                None
+            };
 
         let (need_reserve_block_info, _) = need_reserve_block_info(ctx.clone(), plan.table_index);
-        Ok(ProcessorPtr::create(Box::new(VortexDeserializeDataTransform {
-            ctx: ctx.clone(),
-            scan_id: plan.scan_id,
-            scan_progress,
-            block_reader,
-            index_reader,
-            input,
-            output,
-            output_data: None,
-            src_schema,
-            output_schema,
-            parts: vec![],
-            chunks: vec![],
-            base_block_ids: plan.base_block_ids.clone(),
-            need_reserve_block_info,
-            read_state,
-        })))
+        Ok(ProcessorPtr::create(Box::new(
+            VortexDeserializeDataTransform {
+                ctx: ctx.clone(),
+                scan_id: plan.scan_id,
+                scan_progress,
+                block_reader,
+                index_reader,
+                input,
+                output,
+                output_data: None,
+                src_schema,
+                output_schema,
+                parts: vec![],
+                chunks: vec![],
+                base_block_ids: plan.base_block_ids.clone(),
+                need_reserve_block_info,
+                read_state,
+            },
+        )))
     }
 }
 
@@ -159,7 +180,7 @@ impl Processor for VortexDeserializeDataTransform {
                 self.input.set_need_data();
             }
 
-            return Ok(Event::Sync);
+            return Ok(Event::Async);
         }
 
         if self.input.has_data() {
@@ -174,7 +195,7 @@ impl Processor for VortexDeserializeDataTransform {
                         .into_iter()
                         .map(ReadDataSource::into_vortex)
                         .collect::<Result<Vec<_>>>()?;
-                    return Ok(Event::Sync);
+                    return Ok(Event::Async);
                 }
             }
 
@@ -190,7 +211,7 @@ impl Processor for VortexDeserializeDataTransform {
         Ok(Event::NeedData)
     }
 
-    fn process(&mut self) -> Result<()> {
+    async fn async_process(&mut self) -> Result<()> {
         let part = self.parts.pop();
         let chunks = self.chunks.pop();
         if let Some((part, read_res)) = part.zip(chunks) {
@@ -211,25 +232,91 @@ impl Processor for VortexDeserializeDataTransform {
 
                     self.output_data = Some(block);
                 }
-                VortexDataSource::Normal(data) => {
+                VortexDataSource::Normal(_part) => {
                     let start = Instant::now();
-                    let columns_chunks = data.columns_chunks()?;
                     let fuse_part = FuseBlockPartInfo::from_part(&part)?;
 
-                    let (mut data_block, row_selection, bitmap_selection) =
-                        if let Some(read_state) = &self.read_state {
-                            read_state.deserialize_and_filter(columns_chunks, &fuse_part)?
-                        } else {
-                            let block = self.block_reader.deserialize_vortex_chunks(
-                                fuse_part.nums_rows,
-                                &fuse_part.columns_meta,
-                                columns_chunks,
-                                None,
-                            )?;
-                            (block, None, None)
-                        };
+                    let mut data_block = match &self.read_state {
+                        Some(read_state) => {
+                            match (&read_state.filters, read_state.runtime_filters.is_empty()) {
+                                (Some(filter), true) => {
+                                    let split =
+                                        split_expr_for_vortex(filter, &read_state.prewhere_schema)?;
 
-                    let _ = row_selection;
+                                    match split.scan_filter {
+                                        Some(vortex_filter) => {
+                                            Profile::record_usize_profile(
+                                                ProfileStatisticsName::VortexPredicatePushdownCount,
+                                                1,
+                                            );
+                                            let extra = referenced_field_names(
+                                                filter,
+                                                &read_state.prewhere_schema,
+                                            );
+                                            let opened = open_vortex_file_async(
+                                                self.block_reader.operator.clone(),
+                                                &fuse_part.location,
+                                            )
+                                            .await?;
+                                            let projection =
+                                                self.block_reader.vortex_field_names_for_scan(extra)?;
+                                            let record_batch =
+                                                scan_opened_vortex_file_to_record_batch(
+                                                    &opened,
+                                                    "single",
+                                                    Some(projection),
+                                                    Some(vortex_filter),
+                                                    None,
+                                                )
+                                                .await?;
+                                            let mut data_block = self
+                                                .block_reader
+                                                .map_vortex_record_batch_to_data_block(&record_batch)?;
+                                            if let Some(residual_filter) =
+                                                split.residual_filter.as_ref()
+                                            {
+                                                let prewhere_block = read_state
+                                                    .pre_reader
+                                                    .map_vortex_record_batch_to_data_block(
+                                                        &record_batch,
+                                                    )?;
+                                                let bitmap = filter_bitmap_for_expr(
+                                                    &prewhere_block,
+                                                    residual_filter,
+                                                    &read_state.func_ctx,
+                                                )?;
+                                                data_block = data_block.filter_with_bitmap(&bitmap)?;
+                                            }
+                                            data_block
+                                        }
+                                        None => {
+                                            let (data_block, _row_selection, _bitmap) = read_state
+                                                .deserialize_and_filter_vortex_async(&fuse_part)
+                                                .await?;
+                                            data_block
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    let (data_block, _row_selection, _bitmap) = read_state
+                                        .deserialize_and_filter_vortex_async(&fuse_part)
+                                        .await?;
+                                    data_block
+                                }
+                            }
+                        }
+                        None => {
+                            self.block_reader
+                                .deserialize_vortex_chunks_async(
+                                    &fuse_part.location,
+                                    fuse_part.nums_rows,
+                                    &fuse_part.columns_meta,
+                                    std::collections::HashMap::new(),
+                                    None,
+                                )
+                                .await?
+                        }
+                    };
 
                     metrics_inc_remote_io_deserialize_milliseconds(
                         start.elapsed().as_millis() as u64
@@ -247,18 +334,7 @@ impl Processor for VortexDeserializeDataTransform {
 
                     data_block = data_block.resort(&self.src_schema, &self.output_schema)?;
 
-                    let offsets = if self.block_reader.query_internal_columns() {
-                        bitmap_selection.as_ref().map(|bitmap| {
-                            roaring::RoaringTreemap::from_sorted_iter(
-                                (0..bitmap.len())
-                                    .filter(|i| unsafe { bitmap.get_bit_unchecked(*i) })
-                                    .map(|i| i as u64),
-                            )
-                            .unwrap()
-                        })
-                    } else {
-                        None
-                    };
+                    let offsets = None;
 
                     data_block = add_data_block_meta(
                         data_block,
@@ -276,5 +352,53 @@ impl Processor for VortexDeserializeDataTransform {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use databend_common_expression::ColumnRef;
+    use databend_common_expression::FromData;
+    use databend_common_expression::block_debug::assert_blocks_eq;
+    use databend_common_expression::type_check::check_function;
+    use databend_common_expression::types::DataType;
+    use databend_common_expression::types::Int64Type;
+
+    use super::*;
+
+    fn col_ref(id: usize, display_name: &str) -> Expr {
+        Expr::ColumnRef(ColumnRef {
+            span: None,
+            id,
+            data_type: DataType::Number(databend_common_expression::types::NumberDataType::Int64),
+            display_name: display_name.to_string(),
+        })
+    }
+
+    #[test]
+    fn filter_bitmap_for_expr_filters_rows_with_residual_expression() {
+        let block = DataBlock::new(vec![Int64Type::from_data(vec![19i64, 20, 30]).into()], 3);
+        let b = col_ref(0, "b");
+        let plus = check_function(None, "plus", &[], &[b, Expr::constant(Scalar::Number(1i64.into()), None)], &BUILTIN_FUNCTIONS).unwrap();
+        let filter = check_function(
+            None,
+            "eq",
+            &[],
+            &[plus, Expr::constant(Scalar::Number(21i64.into()), None)],
+            &BUILTIN_FUNCTIONS,
+        )
+        .unwrap();
+
+        let bitmap = filter_bitmap_for_expr(&block, &filter, &FunctionContext::default()).unwrap();
+        let filtered = block.filter_with_bitmap(&bitmap).unwrap();
+
+        let expected = vec![
+            "+----------+",
+            "| Column 0 |",
+            "+----------+",
+            "| 20       |",
+            "+----------+",
+        ];
+        assert_blocks_eq(expected, &[filtered]);
     }
 }

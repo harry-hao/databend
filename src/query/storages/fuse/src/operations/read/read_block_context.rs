@@ -22,7 +22,6 @@ use log::debug;
 
 use super::block_format::FuseBlockFormat;
 use super::block_format::FuseParquetBlockFormat;
-use super::block_format::FuseVortexBlockFormat;
 use super::native_data_source::NativeDataSource;
 use super::parquet_data_source::ParquetDataSource;
 use super::vortex_data_source::VortexDataSource;
@@ -82,27 +81,23 @@ impl ReadBlockContext {
             .as_ref()
             .and_then(|source| source.ignore_column_ids.clone());
 
-        let raw_data = if matches!(self.storage_format, FuseStorageFormat::Vortex) {
-            FuseVortexBlockFormat::read_data_by_merge_io_using_full_block_file(
+        if matches!(self.storage_format, FuseStorageFormat::Vortex) {
+            // For Vortex, use `open_read_at` in the deserializer to avoid redundant merge-IO reads.
+            return Ok(ReadDataSource::Vortex(Box::new(VortexDataSource::Normal(
+                part,
+            ))));
+        }
+
+        let raw_data = self
+            .block_format
+            .read_data_by_merge_io(
                 &self.block_read_ctx,
                 &self.read_settings,
                 &fuse_part.location,
                 &fuse_part.columns_meta,
                 &ignore_column_ids,
-                fuse_part.block_file_size,
             )
-            .await?
-        } else {
-            self.block_format
-                .read_data_by_merge_io(
-                    &self.block_read_ctx,
-                    &self.read_settings,
-                    &fuse_part.location,
-                    &fuse_part.columns_meta,
-                    &ignore_column_ids,
-                )
-                .await?
-        };
+            .await?;
 
         Ok(match raw_data {
             RawDataSource::Native(data) => {
@@ -112,7 +107,8 @@ impl ReadBlockContext {
                 ReadDataSource::Parquet(Box::new(ParquetDataSource::Normal((data, virtual_source))))
             }
             RawDataSource::Vortex(data) => {
-                ReadDataSource::Vortex(Box::new(VortexDataSource::Normal(data)))
+                drop(data);
+                unreachable!("Vortex read_data returns early without merge-io")
             }
         })
     }

@@ -16,6 +16,7 @@ mod locations;
 pub mod read;
 mod segments;
 mod snapshots;
+mod vortex_runtime;
 mod write;
 
 pub use locations::TableMetaLocationGenerator;
@@ -36,6 +37,8 @@ pub use read::TableSnapshotReader;
 pub use read::VirtualBlockReadResult;
 pub use read::VirtualColumnReader;
 pub use read::build_columns_meta;
+pub use read::referenced_field_names;
+pub use read::split_expr_for_vortex;
 pub use segments::SegmentsIO;
 pub use segments::SerializedSegment;
 pub use snapshots::SnapshotLiteExtended;

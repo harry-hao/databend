@@ -83,6 +83,7 @@ impl BlockReader {
                 None,
             ),
             FuseStorageFormat::Vortex => self.deserialize_vortex_chunks(
+                block_path,
                 num_rows,
                 column_metas,
                 column_chunks,
@@ -131,6 +132,7 @@ impl BlockReader {
                 None,
             ),
             FuseStorageFormat::Vortex => self.deserialize_vortex_chunks(
+                &meta.location,
                 num_rows,
                 &meta.col_metas,
                 column_chunks,

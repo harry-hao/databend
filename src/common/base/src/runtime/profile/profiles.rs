@@ -66,6 +66,8 @@ pub enum ProfileStatisticsName {
     MemoryUsage,
     ExternalServerRetryCount,
     ExternalServerRequestCount,
+
+    VortexPredicatePushdownCount,
 }
 
 #[derive(Clone, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize, Debug)]
@@ -373,6 +375,13 @@ pub fn get_statistics_desc() -> Arc<BTreeMap<ProfileStatisticsName, ProfileDesc>
                 display_name: "external server request count",
                 desc: "The count of external server request times",
                 index: ProfileStatisticsName::ExternalServerRequestCount as usize,
+                unit: StatisticsUnit::Count,
+                plain_statistics: true,
+            }),
+            (ProfileStatisticsName::VortexPredicatePushdownCount, ProfileDesc {
+                display_name: "vortex predicate pushdown count",
+                desc: "The number of Vortex scan invocations with predicate pushdown",
+                index: ProfileStatisticsName::VortexPredicatePushdownCount as usize,
                 unit: StatisticsUnit::Count,
                 plain_statistics: true,
             }),

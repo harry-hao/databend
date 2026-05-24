@@ -574,6 +574,13 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(1..=u64::MAX)),
                 }),
+                ("vortex_remain_pushdown_max_selected_ratio", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(15),
+                    desc: "Max selected-row ratio (percentage) for pushing Vortex remain selection into scan.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(0..=100)),
+                }),
                 ("max_execute_time_in_seconds", DefaultSettingValue {
                     value: UserSettingValue::UInt64(0),
                     desc: "Sets the maximum query execution time in seconds. Setting it to 0 means no limit.",
@@ -1866,6 +1873,30 @@ impl DefaultSettings {
                 expect, setting_scope
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use databend_common_exception::Result;
+    use databend_common_meta_app::principal::UserSettingValue;
+
+    use super::*;
+
+    #[test]
+    fn test_vortex_remain_pushdown_max_selected_ratio_default() -> Result<()> {
+        let defaults = DefaultSettings::instance()?;
+        let setting = defaults
+            .settings
+            .get("vortex_remain_pushdown_max_selected_ratio")
+            .expect("setting should exist");
+
+        assert_eq!(setting.value, UserSettingValue::UInt64(25));
+        assert!(matches!(
+            setting.range,
+            Some(SettingRange::Numeric(ref range)) if *range == (0u64..=100u64)
+        ));
+        Ok(())
     }
 }
 

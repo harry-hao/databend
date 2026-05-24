@@ -24,34 +24,127 @@ use databend_common_exception::Result;
 use databend_common_expression::BlockEntry;
 use databend_common_expression::ColumnId;
 use databend_common_expression::DataBlock;
-use databend_common_expression::FilterVisitor;
 use databend_common_expression::TableDataType;
 use databend_common_expression::TableSchema;
 use databend_common_expression::Value;
 use databend_common_expression::types::Bitmap;
-use databend_common_expression::visitor::ValueVisitor;
 use databend_storages_common_table_meta::meta::ColumnMeta;
 use vortex::arrow::IntoArrowArray;
+use vortex::dtype::FieldNames;
+use vortex::expr::Expression;
+use vortex::expr::root;
+use vortex::expr::select;
 use vortex::iter::ArrayIteratorExt;
 use vortex::file::OpenOptionsSessionExt;
-use vortex::io::runtime::BlockingRuntime;
+use vortex::file::VortexFile;
 use vortex::io::runtime::single::SingleThreadRuntime;
+use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
+use log::debug;
 use vortex::VortexSessionDefault;
 
 use super::parquet::RowSelection;
+use super::vortex_read_at::OpendalReadAt;
 use crate::io::BlockReader;
 use crate::io::read::block::block_reader_merge_io::DataItem;
+use databend_common_base::runtime::GlobalIORuntime;
 
 impl BlockReader {
+    /// Build top-level Vortex field projection for this reader, optionally merging extra names.
+    pub(crate) fn vortex_field_names_for_scan(
+        &self,
+        extra_projection: Option<FieldNames>,
+    ) -> Result<FieldNames> {
+        self.assert_vortex_flat_projection()?;
+        let name_paths = column_name_paths(&self.projection, &self.original_schema);
+        let top_level_names = name_paths
+            .iter()
+            .map(|p| p[0].as_str())
+            .collect::<Vec<_>>();
+        let mut projection_vec = top_level_names
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        if let Some(extra) = extra_projection {
+            for f in extra.iter() {
+                let f = f.to_string();
+                if !projection_vec.iter().any(|x| x == &f) {
+                    projection_vec.push(f);
+                }
+            }
+        }
+        Ok(FieldNames::from_iter(
+            projection_vec.iter().map(|s| s.as_str()),
+        ))
+    }
+
+    fn assert_vortex_flat_projection(&self) -> Result<()> {
+        for column_node in self.project_column_nodes.iter() {
+            if column_node.is_nested {
+                return Err(ErrorCode::StorageOther(
+                    "FUSE storage_format='vortex' nested projection is not supported yet",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Map a decoded Vortex `RecordBatch` to a `DataBlock` for this reader's projection.
+    pub(crate) fn map_vortex_record_batch_to_data_block(
+        &self,
+        record_batch: &RecordBatch,
+    ) -> Result<DataBlock> {
+        self.assert_vortex_flat_projection()?;
+        let name_paths = column_name_paths(&self.projection, &self.original_schema);
+        let mut entries = Vec::with_capacity(self.projected_schema.fields.len());
+        for ((i, field), _column_node) in self
+            .projected_schema
+            .fields
+            .iter()
+            .enumerate()
+            .zip(self.project_column_nodes.iter())
+        {
+            let data_type = field.data_type().into();
+
+            let value = match try_column_by_name(record_batch, &name_paths[i]) {
+                Some(arrow_array) => Value::from_arrow_rs(arrow_array, &data_type)?,
+                None => Value::Scalar(self.default_vals[i].clone()),
+            };
+            entries.push(BlockEntry::new(value, || (data_type, record_batch.num_rows())));
+        }
+        Ok(DataBlock::new(entries, record_batch.num_rows()))
+    }
+
     /// Deserialize one FUSE block stored as a single Vortex file (see `encode_data_blocks_as_vortex`).
     pub fn deserialize_vortex_chunks(
         &self,
+        block_path: &str,
         num_rows: usize,
         _column_metas: &HashMap<ColumnId, ColumnMeta>,
         column_chunks: HashMap<ColumnId, DataItem>,
         selection: Option<&RowSelection>,
+    ) -> Result<DataBlock> {
+        self.deserialize_vortex_chunks_with_scan_filter(
+            block_path,
+            num_rows,
+            _column_metas,
+            column_chunks,
+            selection,
+            None,
+            None,
+        )
+    }
+
+    pub fn deserialize_vortex_chunks_with_scan_filter(
+        &self,
+        block_path: &str,
+        num_rows: usize,
+        _column_metas: &HashMap<ColumnId, ColumnMeta>,
+        column_chunks: HashMap<ColumnId, DataItem>,
+        selection: Option<&RowSelection>,
+        scan_filter: Option<Expression>,
+        extra_projection: Option<FieldNames>,
     ) -> Result<DataBlock> {
         let result_rows = selection.map(|s| s.selected_rows).unwrap_or(num_rows);
 
@@ -63,99 +156,124 @@ impl BlockReader {
             return Ok(DataBlock::empty_with_schema(&self.data_schema()));
         }
 
-        let vortex_bytes = first_raw_vortex_bytes(&column_chunks)?;
-        let mut record_batch = decode_vortex_bytes_to_record_batch(&vortex_bytes)?;
+        // The merge-IO path provides column-wise byte spans for caching and other formats, but
+        // Vortex decoding should avoid requiring the full file bytes. We open the Vortex file via
+        // a `VortexReadAt` implementation backed by OpenDAL range reads.
+        //
+        // NOTE: `column_chunks` is currently unused for Vortex decoding; it will be revisited once
+        // we can feed those buffers into Vortex as an optional segment cache.
+        let _ = column_chunks;
 
-        if record_batch.num_rows() != num_rows {
+        let projection = self.vortex_field_names_for_scan(extra_projection)?;
+
+        let scan_filter_present = scan_filter.is_some();
+        let mut record_batch = decode_vortex_file_to_record_batch(
+            self.operator.clone(),
+            block_path,
+            Some(projection),
+            scan_filter,
+        )?;
+
+        // When a scan filter is applied, Vortex may return fewer rows than the on-disk footer count.
+        let result_rows = record_batch.num_rows();
+        if result_rows > num_rows {
             return Err(ErrorCode::BadBytes(format!(
-                "FUSE storage_format='vortex' row count mismatch: metadata {num_rows}, decoded {}",
-                record_batch.num_rows()
+                "FUSE storage_format='vortex' decoded rows {result_rows} exceeds metadata {num_rows}",
             )));
         }
 
         if let Some(selection) = selection {
-            let predicate = bitmap_to_boolean_array(&selection.bitmap)?;
-            record_batch = filter_record_batch(&record_batch, &predicate).map_err(|e| {
-                ErrorCode::BadBytes(format!(
-                    "FUSE storage_format='vortex' failed to apply row filter: {e}"
-                ))
-            })?;
+            if scan_filter_present {
+                return Err(ErrorCode::BadBytes(
+                    "FUSE storage_format='vortex' unexpected combination: scan_filter + row_selection"
+                        .to_string(),
+                ));
+            }
+            record_batch = filter_vortex_record_batch_with_row_selection(record_batch, selection)?;
         }
 
-        let name_paths = column_name_paths(&self.projection, &self.original_schema);
-
-        let mut entries = Vec::with_capacity(self.projected_schema.fields.len());
-        for ((i, field), column_node) in self
-            .projected_schema
-            .fields
-            .iter()
-            .enumerate()
-            .zip(self.project_column_nodes.iter())
-        {
-            let data_type = field.data_type().into();
-
-            let value = match column_chunks.get(&field.column_id) {
-                Some(DataItem::RawData(_)) => {
-                    let arrow_array = column_by_name(&record_batch, &name_paths[i]);
-                    if column_node.is_nested {
-                        return Err(ErrorCode::StorageOther(
-                            "FUSE storage_format='vortex' nested projection is not supported yet",
-                        ));
-                    }
-                    Value::from_arrow_rs(arrow_array, &data_type)?
-                }
-                Some(DataItem::ColumnArray(cached)) => {
-                    if column_node.is_nested {
-                        return Err(ErrorCode::StorageOther(
-                            "unexpected nested field: nested leaf field hits cached (vortex)",
-                        ));
-                    }
-                    let mut value = Value::from_arrow_rs(cached.0.clone(), &data_type)?;
-                    if let Some(selection) = selection {
-                        let mut filter_visitor = FilterVisitor::new(&selection.bitmap);
-                        filter_visitor.visit_value(value)?;
-                        value = filter_visitor.take_result().unwrap();
-                    }
-                    value
-                }
-                None => Value::Scalar(self.default_vals[i].clone()),
-            };
-            entries.push(BlockEntry::new(value, || (data_type, result_rows)));
-        }
-        Ok(DataBlock::new(entries, result_rows))
+        self.map_vortex_record_batch_to_data_block(&record_batch)
     }
 }
 
-fn first_raw_vortex_bytes(column_chunks: &HashMap<ColumnId, DataItem>) -> Result<Vec<u8>> {
-    for (_, item) in column_chunks {
-        if let DataItem::RawData(buf) = item {
-            return Ok(buf.to_vec());
-        }
-    }
-    Err(ErrorCode::BadBytes(
-        "FUSE storage_format='vortex' missing raw column bytes".to_string(),
-    ))
+/// Apply prewhere / pruning row selection to a Vortex `RecordBatch` (Arrow filter).
+pub(crate) fn filter_vortex_record_batch_with_row_selection(
+    record_batch: RecordBatch,
+    selection: &RowSelection,
+) -> Result<RecordBatch> {
+    let predicate = bitmap_to_boolean_array(&selection.bitmap)?;
+    filter_record_batch(&record_batch, &predicate).map_err(|e| {
+        ErrorCode::BadBytes(format!(
+            "FUSE storage_format='vortex' failed to apply row filter: {e}"
+        ))
+    })
 }
 
-fn decode_vortex_bytes_to_record_batch(bytes: &[u8]) -> Result<RecordBatch> {
+/// Holds a single opened Vortex block file together with the runtime and session used to open it,
+/// so scan/decode can be performed (once or multiple times) without reopening the underlying file.
+/// Fields are ordered so `file` drops before `_session` and `rt` (declaration-order drop).
+pub(crate) struct OpenedVortexFile {
+    file: VortexFile,
+    _session: VortexSession,
+    rt: SingleThreadRuntime,
+}
+
+pub(crate) fn open_vortex_file(
+    operator: opendal::Operator,
+    location: &str,
+) -> Result<OpenedVortexFile> {
+    debug!("[vortex-open] location={}", location);
     let rt = SingleThreadRuntime::default();
     let session = VortexSession::default().with_handle(rt.handle());
-    let file = session
-        .open_options()
-        .open_buffer(bytes.to_vec())
-        .map_err(|e| {
-            ErrorCode::BadBytes(format!(
-                "FUSE storage_format='vortex' failed to open Vortex buffer: {e}"
-            ))
+    let session_for_open = session.clone();
+    let file = GlobalIORuntime::instance()
+        .block_on(async move {
+            let read_at = OpendalReadAt::open(operator, location).await.map_err(|e| {
+                ErrorCode::BadBytes(format!(
+                    "FUSE storage_format='vortex' failed to build read_at for {location}: {e}"
+                ))
+            })?;
+            session_for_open
+                .open_options()
+                .open_read_at(read_at)
+                .await
+                .map_err(|e| {
+                    ErrorCode::BadBytes(format!(
+                        "FUSE storage_format='vortex' failed to open Vortex file via read_at: {e}"
+                    ))
+                })
         })?;
-    let array_ref = file
-        .scan()
-        .map_err(|e| {
-            ErrorCode::BadBytes(format!(
-                "FUSE storage_format='vortex' failed to begin scan: {e}"
-            ))
-        })?
-        .into_array_iter(&rt)
+
+    Ok(OpenedVortexFile {
+        file,
+        _session: session,
+        rt,
+    })
+}
+
+pub(crate) fn scan_opened_vortex_file_to_record_batch(
+    opened: &OpenedVortexFile,
+    projection: Option<FieldNames>,
+    scan_filter: Option<Expression>,
+) -> Result<RecordBatch> {
+    let scan = opened.file.scan().map_err(|e| {
+        ErrorCode::BadBytes(format!(
+            "FUSE storage_format='vortex' failed to begin scan: {e}"
+        ))
+    })?;
+
+    let scan = match scan_filter {
+        Some(filter) => scan.with_filter(filter),
+        None => scan,
+    };
+
+    let scan = match projection {
+        Some(fields) => scan.with_projection(select(fields, root())),
+        None => scan,
+    };
+
+    let array_ref = scan
+        .into_array_iter(&opened.rt)
         .map_err(|e| {
             ErrorCode::BadBytes(format!(
                 "FUSE storage_format='vortex' failed to build scan iterator: {e}"
@@ -169,6 +287,16 @@ fn decode_vortex_bytes_to_record_batch(bytes: &[u8]) -> Result<RecordBatch> {
         })?;
 
     record_batch_from_vortex_root(array_ref)
+}
+
+fn decode_vortex_file_to_record_batch(
+    operator: opendal::Operator,
+    location: &str,
+    projection: Option<FieldNames>,
+    scan_filter: Option<Expression>,
+) -> Result<RecordBatch> {
+    let opened = open_vortex_file(operator, location)?;
+    scan_opened_vortex_file_to_record_batch(&opened, projection, scan_filter)
 }
 
 fn record_batch_from_vortex_root(array_ref: vortex::ArrayRef) -> Result<RecordBatch> {
@@ -191,22 +319,23 @@ fn record_batch_from_vortex_root(array_ref: vortex::ArrayRef) -> Result<RecordBa
     Ok(RecordBatch::from(struct_array.clone()))
 }
 
+fn try_column_by_name(record_batch: &RecordBatch, name_path: &[String]) -> Option<ArrayRef> {
+    if name_path.is_empty() {
+        return None;
+    }
+    let mut array: ArrayRef = record_batch.column_by_name(&name_path[0])?.clone();
+    for name in name_path.iter().skip(1) {
+        let struct_array = array.as_any().downcast_ref::<StructArray>()?;
+        array = struct_array.column_by_name(name)?.clone();
+    }
+    Some(array)
+}
+
 fn bitmap_to_boolean_array(bitmap: &Bitmap) -> Result<arrow_array::BooleanArray> {
     let values: Vec<bool> = (0..bitmap.len())
         .map(|i| unsafe { bitmap.get_bit_unchecked(i) })
         .collect();
     Ok(arrow_array::BooleanArray::from(values))
-}
-
-fn column_by_name(record_batch: &RecordBatch, names: &[String]) -> ArrayRef {
-    let mut array = record_batch.column_by_name(&names[0]).unwrap().clone();
-    if names.len() > 1 {
-        for name in &names[1..] {
-            let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
-            array = struct_array.column_by_name(name).unwrap().clone();
-        }
-    }
-    array
 }
 
 fn column_name_paths(projection: &Projection, schema: &TableSchema) -> Vec<Vec<String>> {

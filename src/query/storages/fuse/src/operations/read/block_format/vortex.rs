@@ -35,8 +35,9 @@ impl FuseVortexBlockFormat {
         Arc::new(Self)
     }
 
-    /// Merge IO must fetch a contiguous prefix that covers the Vortex footer; use the on-disk
-    /// block size from segment metadata when available.
+    /// Legacy helper for the `open_buffer` fallback: merge-IO must fetch a contiguous prefix that
+    /// covers the Vortex footer; use the on-disk block size from segment metadata when available.
+    #[allow(dead_code)]
     fn resolve_read_size(block_file_size: u64, columns_meta: &HashMap<ColumnId, ColumnMeta>) -> u64 {
         if block_file_size > 0 {
             return block_file_size;
@@ -51,9 +52,10 @@ impl FuseVortexBlockFormat {
             .unwrap_or(0)
     }
 
-    /// `open_buffer` decoding needs the full file bytes; widen each projected column range to the
+    /// Legacy helper for the `open_buffer` fallback: decoding needs the full file bytes; widen each projected column range to the
     /// same `[0, size)` so merge IO coalesces to one remote read while keeping accurate per-column
     /// spans in `FuseBlockPartInfo::columns_meta` for pruning and statistics.
+    #[allow(dead_code)]
     fn patch_columns_meta_for_full_file_read(
         columns_meta: &HashMap<ColumnId, ColumnMeta>,
         size: u64,
@@ -74,6 +76,7 @@ impl FuseVortexBlockFormat {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub async fn read_data_by_merge_io_using_full_block_file(
         read_ctx: &BlockReadContext,
         settings: &ReadSettings,
@@ -103,15 +106,11 @@ impl FuseBlockFormat for FuseVortexBlockFormat {
         columns_meta: &HashMap<ColumnId, ColumnMeta>,
         ignore_column_ids: &Option<HashSet<ColumnId>>,
     ) -> Result<RawDataSource> {
-        Self::read_data_by_merge_io_using_full_block_file(
-            read_ctx,
-            settings,
-            location,
-            columns_meta,
-            ignore_column_ids,
-            0,
-        )
-        .await
+        let source = read_ctx
+            .read_columns_data_by_merge_io(settings, location, columns_meta, ignore_column_ids)
+            .await?;
+
+        Ok(RawDataSource::Vortex(source))
     }
 
     async fn read_block_meta(&self, _operator: &Operator, _location: &str) -> Option<ReadBlockMeta> {

@@ -4696,6 +4696,7 @@ dependencies = [
  "backoff",
  "bytes",
  "chrono",
+ "dashmap 6.1.0",
  "databend-common-base",
  "databend-common-catalog",
  "databend-common-column",
@@ -6186,6 +6187,8 @@ dependencies = [
  "unicase",
  "url",
  "uuid",
+ "vortex",
+ "vortex-array",
  "walkdir",
  "wiremock",
  "zip",
@@ -6294,6 +6297,7 @@ dependencies = [
  "rustix 0.38.44",
  "siphasher 0.3.11",
  "tempfile",
+ "vortex",
 ]
 
 [[package]]

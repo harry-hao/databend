@@ -200,6 +200,8 @@ temp-env = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }
 url = { workspace = true }
+vortex = { workspace = true }
+vortex-array = "0.56.0"
 wiremock = { workspace = true }
 
 [build-dependencies]
