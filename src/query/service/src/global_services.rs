@@ -20,6 +20,7 @@ use databend_common_base::base::GlobalInstance;
 use databend_common_base::runtime::GLOBAL_QUERIES_MANAGER;
 use databend_common_base::runtime::GlobalIORuntime;
 use databend_common_base::runtime::GlobalQueryRuntime;
+use databend_common_base::runtime::GlobalVortexRuntime;
 use databend_common_catalog::catalog::CatalogCreator;
 use databend_common_catalog::catalog::CatalogManager;
 use databend_common_cloud_control::cloud_api::CloudControlApiProvider;
@@ -109,6 +110,7 @@ impl GlobalServices {
         // 3. runtime init.
         GlobalIORuntime::init(config.storage.num_cpus as usize)?;
         GlobalQueryRuntime::init(config.storage.num_cpus as usize)?;
+        GlobalVortexRuntime::init(config.storage.num_cpus as usize)?;
 
         // 4. cluster discovery init.
         ClusterDiscovery::init(config, version).await?;

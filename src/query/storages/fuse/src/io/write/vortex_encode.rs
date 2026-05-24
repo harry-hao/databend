@@ -38,7 +38,6 @@ use vortex::arrow::FromArrowArray;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::SegmentSpec;
 use vortex::file::WriteOptionsSessionExt;
-use vortex::io::runtime::BlockingRuntime;
 use vortex::io::runtime::single::SingleThreadRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::iter::ArrayIteratorAdapter;
@@ -46,6 +45,8 @@ use vortex::layout::LayoutChildType;
 use vortex::layout::LayoutRef;
 use vortex::layout::segments::SegmentId;
 use vortex::session::VortexSession;
+
+use crate::io::vortex_runtime::vortex_handle;
 
 /// Build [`ColumnMeta::Vortex`] entries from an already-serialized Vortex file.
 ///
@@ -55,8 +56,8 @@ pub fn column_vortex_metas_from_bytes(
     schema: &TableSchemaRef,
     row_count: u64,
 ) -> Result<HashMap<ColumnId, ColumnMeta>> {
-    let rt = SingleThreadRuntime::default();
-    let session = VortexSession::default().with_handle(rt.handle());
+    let handle = vortex_handle();
+    let session = VortexSession::default().with_handle(handle);
     let file = session
         .open_options()
         .open_buffer(buf.to_vec())
@@ -129,9 +130,7 @@ fn normalize_to_struct_root(mut layout: LayoutRef) -> vortex::error::VortexResul
 
 /// Depth-first over struct children (skips auxiliary children); each non-struct subtree is one
 /// leaf column, aligned with `TableSchema::to_leaf_column_ids()`.
-fn collect_leaf_column_layouts(
-    layout: &LayoutRef,
-) -> vortex::error::VortexResult<Vec<LayoutRef>> {
+fn collect_leaf_column_layouts(layout: &LayoutRef) -> vortex::error::VortexResult<Vec<LayoutRef>> {
     let mut out = Vec::new();
     collect_leaf_dfs(layout, &mut out)?;
     Ok(out)
@@ -218,7 +217,8 @@ pub fn encode_data_blocks_as_vortex(
     let array_iter = ArrayIteratorAdapter::new(dtype, chunk_iter);
 
     let rt = SingleThreadRuntime::default();
-    let session = VortexSession::default().with_handle(rt.handle());
+    let handle = vortex_handle();
+    let session = VortexSession::default().with_handle(handle);
     let mut buf = Vec::new();
     session
         .write_options()

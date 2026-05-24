@@ -18,6 +18,7 @@ use arrow_array::Array;
 use arrow_array::ArrayRef;
 use arrow_array::RecordBatch;
 use arrow_array::StructArray;
+use databend_common_base::runtime::GlobalIORuntime;
 use databend_common_catalog::plan::Projection;
 use databend_common_exception::ErrorCode;
 use databend_common_expression::BlockEntry;
@@ -76,13 +77,8 @@ impl BlockReader {
                     column_chunks,
                 )
             }
-            FuseStorageFormat::Vortex => self.deserialize_vortex_chunks(
-                &part.location,
-                part.nums_rows,
-                &part.columns_meta,
-                column_chunks,
-                selection,
-            ),
+            FuseStorageFormat::Vortex => GlobalIORuntime::instance()
+                .block_on(self.read_block(&part.location, part.nums_rows, None, None, None, selection)),
         }
     }
 

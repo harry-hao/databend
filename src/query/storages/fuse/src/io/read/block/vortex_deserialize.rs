@@ -12,63 +12,74 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::LazyLock;
 
 use arrow_array::ArrayRef;
 use arrow_array::RecordBatch;
 use arrow_array::StructArray;
 use arrow_select::filter::filter_record_batch;
+use dashmap::DashMap;
+use databend_common_base::runtime::GlobalIORuntime;
 use databend_common_catalog::plan::Projection;
+use databend_common_column::bitmap::utils::SlicesIterator;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::BlockEntry;
-use databend_common_expression::ColumnId;
 use databend_common_expression::DataBlock;
-use databend_common_expression::TableDataType;
-use databend_common_expression::TableSchema;
 use databend_common_expression::Value;
 use databend_common_expression::types::Bitmap;
-use databend_storages_common_table_meta::meta::ColumnMeta;
+use databend_common_metrics::storage::metrics_inc_remote_io_read_parts;
+use databend_storages_common_cache::CacheAccessor;
+use databend_storages_common_cache::CacheManager;
+use futures_util::StreamExt;
+use futures_util::pin_mut;
+use tokio::sync::Mutex;
+use vortex::IntoArray;
+use vortex::VortexSessionDefault;
+use vortex::arrays::ChunkedArray;
 use vortex::arrow::IntoArrowArray;
+use vortex::buffer::Buffer;
 use vortex::dtype::FieldNames;
 use vortex::expr::Expression;
 use vortex::expr::root;
 use vortex::expr::select;
-use vortex::iter::ArrayIterator;
-use vortex::buffer::Buffer;
-use vortex::arrays::ChunkedArray;
+use vortex::file::Footer;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::file::VortexFile;
-use vortex::io::runtime::single::SingleThreadRuntime;
-use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
-use vortex::IntoArray;
-use vortex::VortexSessionDefault;
+use vortex::stream::ArrayStream;
 
 use super::parquet::RowSelection;
-use super::vortex_read_at::OpendalReadAt;
+use super::vortex_read_at::OpendalReadSource;
 use crate::io::BlockReader;
-use crate::io::read::block::block_reader_merge_io::DataItem;
-use databend_common_base::runtime::GlobalIORuntime;
+use crate::io::vortex_runtime::vortex_handle;
+
+static IN_FLIGHT_VORTEX_FOOTERS: LazyLock<DashMap<String, Arc<Mutex<()>>>> =
+    LazyLock::new(DashMap::new);
 
 impl BlockReader {
-    /// Build top-level Vortex field projection for this reader, optionally merging extra names.
-    pub(crate) fn vortex_field_names_for_scan(
+    /// Build Vortex projection list for this reader, optionally merging extra field names
+    /// required by a residual filter expression.
+    pub(crate) fn projection_field_names(
         &self,
-        extra_projection: Option<FieldNames>,
+        extra_fields: Option<FieldNames>,
     ) -> Result<FieldNames> {
-        self.assert_vortex_flat_projection()?;
-        let name_paths = column_name_paths(&self.projection, &self.original_schema);
-        let top_level_names = name_paths
-            .iter()
-            .map(|p| p[0].as_str())
-            .collect::<Vec<_>>();
-        let mut projection_vec = top_level_names
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
-        if let Some(extra) = extra_projection {
+        // FIXME: support InnerColumns (nested) projection for Vortex once read_record_batch
+        // gains path-aware projection; Arrow StructArray sub-field extraction is needed.
+        let mut projection_vec: Vec<String> = match &self.projection {
+            Projection::Columns(indices) => indices
+                .iter()
+                .map(|i| self.original_schema.fields[*i].name().to_string())
+                .collect(),
+            Projection::InnerColumns(_) => {
+                return Err(ErrorCode::StorageOther(
+                    "FUSE storage_format='vortex' nested (InnerColumns) projection is not supported yet",
+                ));
+            }
+        };
+        if let Some(extra) = extra_fields {
             for f in extra.iter() {
                 let f = f.to_string();
                 if !projection_vec.iter().any(|x| x == &f) {
@@ -81,27 +92,26 @@ impl BlockReader {
         ))
     }
 
-    fn assert_vortex_flat_projection(&self) -> Result<()> {
-        for column_node in self.project_column_nodes.iter() {
-            if column_node.is_nested {
-                return Err(ErrorCode::StorageOther(
-                    "FUSE storage_format='vortex' nested projection is not supported yet",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Map a decoded Vortex `RecordBatch` to a `DataBlock` for this reader's projection.
-    pub(crate) fn map_vortex_record_batch_to_data_block(
+    /// Convert a decoded Vortex `RecordBatch` into a `DataBlock` using this reader's projection.
+    pub(crate) fn record_batch_to_block(
         &self,
         record_batch: &RecordBatch,
     ) -> Result<DataBlock> {
-        self.assert_vortex_flat_projection()?;
         if record_batch.num_rows() == 0 {
             return Ok(DataBlock::empty_with_schema(&self.data_schema()));
         }
-        let name_paths = column_name_paths(&self.projection, &self.original_schema);
+        // FIXME: support InnerColumns (nested) projection for Vortex.
+        let field_names: Vec<String> = match &self.projection {
+            Projection::Columns(indices) => indices
+                .iter()
+                .map(|i| self.original_schema.fields[*i].name().to_string())
+                .collect(),
+            Projection::InnerColumns(_) => {
+                return Err(ErrorCode::StorageOther(
+                    "FUSE storage_format='vortex' nested (InnerColumns) projection is not supported yet",
+                ));
+            }
+        };
         let mut entries = Vec::with_capacity(self.projected_schema.fields.len());
         for ((i, field), _column_node) in self
             .projected_schema
@@ -112,48 +122,42 @@ impl BlockReader {
         {
             let data_type = field.data_type().into();
 
-            let value = match try_column_by_name(record_batch, &name_paths[i]) {
+            let value = match try_column_by_name(record_batch, &[field_names[i].clone()]) {
                 Some(arrow_array) => Value::from_arrow_rs(arrow_array, &data_type)?,
                 None => Value::Scalar(self.default_vals[i].clone()),
             };
-            entries.push(BlockEntry::new(value, || (data_type, record_batch.num_rows())));
+            entries.push(BlockEntry::new(value, || {
+                (data_type, record_batch.num_rows())
+            }));
         }
         Ok(DataBlock::new(entries, record_batch.num_rows()))
     }
 
-    /// Deserialize one FUSE block stored as a single Vortex file (see `encode_data_blocks_as_vortex`).
-    pub fn deserialize_vortex_chunks(
-        &self,
-        block_path: &str,
-        num_rows: usize,
-        _column_metas: &HashMap<ColumnId, ColumnMeta>,
-        column_chunks: HashMap<ColumnId, DataItem>,
-        selection: Option<&RowSelection>,
-    ) -> Result<DataBlock> {
-        self.deserialize_vortex_chunks_with_scan_filter(
-            block_path,
-            num_rows,
-            _column_metas,
-            column_chunks,
-            selection,
-            None,
-            None,
-            None,
-        )
+    /// Open the Vortex block file at `location` using this reader's operator.
+    ///
+    /// The returned [`VortexBlock`] can be scanned multiple times (e.g. prewhere + remain)
+    /// without re-opening or re-fetching the file footer.
+    pub(crate) async fn open_block(&self, location: &str) -> Result<VortexBlock> {
+        open_vortex_block(self.operator.clone(), location).await
     }
 
-    pub fn deserialize_vortex_chunks_with_scan_filter(
+    /// Read a FUSE block stored as a Vortex file and return a [`DataBlock`].
+    ///
+    /// - `filter` – optional Vortex predicate pushed down into the file scan.
+    /// - `extra_fields` – additional top-level field names to project (e.g. residual filter cols).
+    /// - `row_indices` – explicit sorted row indices to decode (point-lookup). Cannot be combined
+    ///   with `filter`.
+    /// - `row_selection` – post-decode row bitmap. Cannot be combined with `filter`.
+    pub async fn read_block<'c>(
         &self,
-        block_path: &str,
+        location: &str,
         num_rows: usize,
-        _column_metas: &HashMap<ColumnId, ColumnMeta>,
-        column_chunks: HashMap<ColumnId, DataItem>,
-        selection: Option<&RowSelection>,
-        scan_filter: Option<Expression>,
-        extra_projection: Option<FieldNames>,
-        row_indices: Option<&[u32]>,
+        filter: Option<Expression>,
+        extra_fields: Option<FieldNames>,
+        row_indices: Option<&'c [u32]>,
+        row_selection: Option<&RowSelection>,
     ) -> Result<DataBlock> {
-        let result_rows = selection.map(|s| s.selected_rows).unwrap_or(num_rows);
+        let result_rows = row_selection.map(|s| s.selected_rows).unwrap_or(num_rows);
 
         if self.projected_schema.fields.is_empty() {
             return Ok(DataBlock::empty_with_rows(result_rows));
@@ -163,26 +167,13 @@ impl BlockReader {
             return Ok(DataBlock::empty_with_schema(&self.data_schema()));
         }
 
-        // The merge-IO path provides column-wise byte spans for caching and other formats, but
-        // Vortex decoding should avoid requiring the full file bytes. We open the Vortex file via
-        // a `VortexReadAt` implementation backed by OpenDAL range reads.
-        //
-        // NOTE: `column_chunks` is currently unused for Vortex decoding; it will be revisited once
-        // we can feed those buffers into Vortex as an optional segment cache.
-        let _ = column_chunks;
+        let projection = self.projection_field_names(extra_fields)?;
 
-        let projection = self.vortex_field_names_for_scan(extra_projection)?;
+        let filter_present = filter.is_some();
+        let opened = open_vortex_block(self.operator.clone(), location).await?;
+        let mut record_batch =
+            read_record_batch(&opened, Some(projection), filter, row_indices).await?;
 
-        let scan_filter_present = scan_filter.is_some();
-        let mut record_batch = decode_vortex_file_to_record_batch(
-            self.operator.clone(),
-            block_path,
-            Some(projection),
-            scan_filter,
-            row_indices,
-        )?;
-
-        // When a scan filter is applied, Vortex may return fewer rows than the on-disk footer count.
         let result_rows = record_batch.num_rows();
         if result_rows > num_rows {
             return Err(ErrorCode::BadBytes(format!(
@@ -190,82 +181,163 @@ impl BlockReader {
             )));
         }
 
-        if let Some(selection) = selection {
-            if scan_filter_present {
+        if let Some(selection) = row_selection {
+            if filter_present {
                 return Err(ErrorCode::BadBytes(
-                    "FUSE storage_format='vortex' unexpected combination: scan_filter + row_selection"
+                    "FUSE storage_format='vortex' unexpected combination: filter + row_selection"
                         .to_string(),
                 ));
             }
-            record_batch = filter_vortex_record_batch_with_row_selection(record_batch, selection)?;
+            record_batch = apply_row_selection(record_batch, selection)?;
         }
 
-        self.map_vortex_record_batch_to_data_block(&record_batch)
+        self.record_batch_to_block(&record_batch)
+    }
+
+    /// Synchronous wrapper for [`read_block`]. Used by MutationSource and AggregationContext.
+    pub fn deserialize_vortex_block(&self, location: &str, num_rows: usize) -> Result<DataBlock> {
+        GlobalIORuntime::instance()
+            .block_on(self.read_block(location, num_rows, None, None, None, None))
     }
 }
 
-/// Apply prewhere / pruning row selection to a Vortex `RecordBatch` (Arrow filter).
-pub(crate) fn filter_vortex_record_batch_with_row_selection(
+/// Apply a row-selection bitmap to a `RecordBatch` (Arrow boolean filter).
+pub(crate) fn apply_row_selection(
     record_batch: RecordBatch,
     selection: &RowSelection,
 ) -> Result<RecordBatch> {
     let predicate = bitmap_to_boolean_array(&selection.bitmap)?;
     filter_record_batch(&record_batch, &predicate).map_err(|e| {
         ErrorCode::BadBytes(format!(
-            "FUSE storage_format='vortex' failed to apply row filter: {e}"
+            "FUSE storage_format='vortex' failed to apply row selection: {e}"
         ))
     })
 }
 
-/// Holds a single opened Vortex block file together with the runtime and session used to open it,
-/// so scan/decode can be performed (once or multiple times) without reopening the underlying file.
-/// Fields are ordered so `file` drops before `_session` and `rt` (declaration-order drop).
-pub(crate) struct OpenedVortexFile {
-    file: VortexFile,
-    _session: VortexSession,
-    rt: SingleThreadRuntime,
+/// Convert a [`RowSelection`] bitmap into a sorted `Vec<u32>` of selected row indices.
+pub(crate) fn row_selection_to_indices(selection: &RowSelection) -> Vec<u32> {
+    let mut out = Vec::with_capacity(selection.selected_rows);
+    for (start, len) in SlicesIterator::new(&selection.bitmap) {
+        for idx in start..start + len {
+            out.push(idx as u32);
+        }
+    }
+    out
 }
 
-pub(crate) fn open_vortex_file(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VortexRemainScanMode {
+    Pushdown,
+    FullScanFilter,
+}
+
+/// Decide how to scan the remain columns given the row selection from the prewhere stage.
+pub(crate) fn remain_scan_mode(
+    selection: &RowSelection,
+    total_rows: usize,
+    max_selected_ratio: u64,
+) -> VortexRemainScanMode {
+    debug_assert!(
+        selection.selected_rows > 0 && total_rows > 0,
+        "zero-row selection must be handled before calling this function"
+    );
+
+    let selected_ratio = (selection.selected_rows as u128 * 100) / total_rows as u128;
+    if selected_ratio > max_selected_ratio as u128 {
+        return VortexRemainScanMode::FullScanFilter;
+    }
+
+    VortexRemainScanMode::Pushdown
+}
+
+/// An opened Vortex block file that can be scanned multiple times without re-fetching the footer.
+///
+/// Fields are ordered so `file` drops before `_session` (declaration-order drop).
+pub(crate) struct VortexBlock {
+    file: VortexFile,
+    _session: VortexSession,
+}
+
+/// Open the Vortex block file at `location`, using the cached footer when available.
+pub(crate) async fn open_vortex_block(
     operator: opendal::Operator,
     location: &str,
-) -> Result<OpenedVortexFile> {
-    let rt = SingleThreadRuntime::default();
-    let session = VortexSession::default().with_handle(rt.handle());
-    let session_for_open = session.clone();
-    let file = GlobalIORuntime::instance()
-        .block_on(async move {
-            let read_at = OpendalReadAt::open(operator, location).await.map_err(|e| {
-                ErrorCode::BadBytes(format!(
-                    "FUSE storage_format='vortex' failed to build read_at for {location}: {e}"
-                ))
-            })?;
-            let file = session_for_open
-                .open_options()
-                .open_read_at(read_at)
-                .await
-                .map_err(|e| {
-                    ErrorCode::BadBytes(format!(
-                        "FUSE storage_format='vortex' failed to open Vortex file via read_at: {e}"
-                    ))
-                })
-                .map_err(|e| e)
-                ?;
-            Ok::<_, ErrorCode>(file)
-        })?;
+) -> Result<VortexBlock> {
+    metrics_inc_remote_io_read_parts(1);
 
-    Ok(OpenedVortexFile {
+    if let Some(footer) = get_cached_vortex_footer(location) {
+        return open_vortex_block_with_footer(operator, location, Some(footer)).await;
+    }
+
+    let load_lock = IN_FLIGHT_VORTEX_FOOTERS
+        .entry(location.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let _guard = load_lock.lock().await;
+
+    if let Some(footer) = get_cached_vortex_footer_without_miss(location) {
+        return open_vortex_block_with_footer(operator, location, Some(footer)).await;
+    }
+
+    let opened = open_vortex_block_with_footer(operator, location, None).await;
+    IN_FLIGHT_VORTEX_FOOTERS.remove(location);
+    let opened = opened?;
+
+    if let Some(cache) = CacheManager::instance().get_vortex_footer_cache() {
+        cache.insert(location.to_string(), opened.file.footer().clone());
+    }
+
+    Ok(opened)
+}
+
+fn get_cached_vortex_footer(location: &str) -> Option<Footer> {
+    CacheManager::instance()
+        .get_vortex_footer_cache()
+        .and_then(|cache| cache.get(location).map(|footer| footer.as_ref().clone()))
+}
+
+fn get_cached_vortex_footer_without_miss(location: &str) -> Option<Footer> {
+    let cache = CacheManager::instance().get_vortex_footer_cache()?;
+    if !cache.contains_key(location) {
+        return None;
+    }
+
+    cache.get(location).map(|footer| footer.as_ref().clone())
+}
+
+async fn open_vortex_block_with_footer(
+    operator: opendal::Operator,
+    location: &str,
+    footer: Option<Footer>,
+) -> Result<VortexBlock> {
+    let session = VortexSession::default().with_handle(vortex_handle());
+    let session_for_open = session.clone();
+    let source = OpendalReadSource::new(operator, location);
+    let mut open_options = session_for_open.open_options().with_initial_read_size(0);
+    if let Some(footer) = footer {
+        open_options = open_options.with_footer(footer);
+    }
+    let file = open_options.open(source).await.map_err(|e| {
+        ErrorCode::BadBytes(format!(
+            "FUSE storage_format='vortex' failed to open Vortex file: {e}"
+        ))
+    })?;
+
+    Ok(VortexBlock {
         file,
         _session: session,
-        rt,
     })
 }
 
-pub(crate) fn scan_opened_vortex_file_to_record_batch(
-    opened: &OpenedVortexFile,
-    _stage: &'static str,
+/// Scan an already-opened [`VortexBlock`] and return a `RecordBatch`.
+///
+/// - `projection` – top-level field names to include; `None` reads all fields.
+/// - `filter` – optional Vortex predicate for row-level pushdown.
+/// - `row_indices` – explicit sorted row indices (point-lookup).
+pub(crate) async fn read_record_batch(
+    opened: &VortexBlock,
     projection: Option<FieldNames>,
-    scan_filter: Option<Expression>,
+    filter: Option<Expression>,
     row_indices: Option<&[u32]>,
 ) -> Result<RecordBatch> {
     let scan = opened.file.scan().map_err(|e| {
@@ -274,8 +346,8 @@ pub(crate) fn scan_opened_vortex_file_to_record_batch(
         ))
     })?;
 
-    let scan = match scan_filter {
-        Some(filter) => scan.with_filter(filter),
+    let scan = match filter {
+        Some(f) => scan.with_filter(f),
         None => scan,
     };
 
@@ -289,37 +361,31 @@ pub(crate) fn scan_opened_vortex_file_to_record_batch(
         None => scan,
     };
 
-    let mut array_iter = scan.into_array_iter(&opened.rt).map_err(|e| {
+    let array_stream = scan.into_array_stream().map_err(|e| {
         ErrorCode::BadBytes(format!(
-            "FUSE storage_format='vortex' failed to build scan iterator: {e}"
+            "FUSE storage_format='vortex' failed to build scan stream: {e}"
         ))
     })?;
 
-    let iter_dtype = array_iter.dtype().clone();
+    let iter_dtype = array_stream.dtype().clone();
+    pin_mut!(array_stream);
     let mut chunks = Vec::new();
     let mut chunk_idx = 0usize;
-    loop {
-        let next_item = array_iter.next();
-
-        match next_item {
-            None => break,
-            Some(item) => {
-                let chunk = item.map_err(|e| {
-                    ErrorCode::BadBytes(format!(
-                        "FUSE storage_format='vortex' failed to read chunk {}: {e}",
-                        chunk_idx
-                    ))
-                })?;
-                chunks.push(chunk);
-                chunk_idx += 1;
-            }
-        }
+    while let Some(item) = array_stream.next().await {
+        let chunk = item.map_err(|e| {
+            ErrorCode::BadBytes(format!(
+                "FUSE storage_format='vortex' failed to read chunk {}: {e}",
+                chunk_idx
+            ))
+        })?;
+        chunks.push(chunk);
+        chunk_idx += 1;
     }
 
     let array_ref = if chunks.len() == 1 {
-        chunks
-            .pop()
-            .ok_or_else(|| ErrorCode::BadBytes("FUSE storage_format='vortex' empty chunk stream".to_string()))?
+        chunks.pop().ok_or_else(|| {
+            ErrorCode::BadBytes("FUSE storage_format='vortex' empty chunk stream".to_string())
+        })?
     } else {
         ChunkedArray::try_new(chunks, iter_dtype)
             .map_err(|e| {
@@ -330,26 +396,7 @@ pub(crate) fn scan_opened_vortex_file_to_record_batch(
             .into_array()
     };
 
-    let rb = record_batch_from_vortex_root(array_ref)?;
-
-    Ok(rb)
-}
-
-fn decode_vortex_file_to_record_batch(
-    operator: opendal::Operator,
-    location: &str,
-    projection: Option<FieldNames>,
-    scan_filter: Option<Expression>,
-    row_indices: Option<&[u32]>,
-) -> Result<RecordBatch> {
-    let opened = open_vortex_file(operator, location)?;
-    scan_opened_vortex_file_to_record_batch(
-        &opened,
-        "single",
-        projection,
-        scan_filter,
-        row_indices,
-    )
+    record_batch_from_vortex_root(array_ref)
 }
 
 fn record_batch_from_vortex_root(array_ref: vortex::ArrayRef) -> Result<RecordBatch> {
@@ -391,37 +438,53 @@ fn bitmap_to_boolean_array(bitmap: &Bitmap) -> Result<arrow_array::BooleanArray>
     Ok(arrow_array::BooleanArray::from(values))
 }
 
-fn column_name_paths(projection: &Projection, schema: &TableSchema) -> Vec<Vec<String>> {
-    match projection {
-        Projection::Columns(field_indices) => field_indices
-            .iter()
-            .map(|i| vec![schema.fields[*i].name().to_string()])
-            .collect(),
-        Projection::InnerColumns(path_indices) => {
-            let mut name_paths = Vec::with_capacity(path_indices.len());
-            for index_path in path_indices.values() {
-                let mut name_path = Vec::with_capacity(index_path.len());
-                let first_index = index_path[0];
-                name_path.push(schema.fields[first_index].name().to_string());
-                let mut idx = 1;
-                let mut ty = schema.fields[first_index].data_type().clone();
-                while idx < index_path.len() {
-                    match ty.remove_nullable() {
-                        TableDataType::Tuple {
-                            fields_name,
-                            fields_type,
-                        } => {
-                            let next_index = index_path[idx];
-                            name_path.push(fields_name[next_index].clone());
-                            ty = fields_type[next_index].clone();
-                        }
-                        _ => unreachable!(),
-                    }
-                    idx += 1;
-                }
-                name_paths.push(name_path);
+#[cfg(test)]
+mod tests {
+    use databend_common_expression::types::MutableBitmap;
+
+    use super::*;
+
+    #[test]
+    fn test_row_selection_to_indices() {
+        let mut bitmap = MutableBitmap::from_len_zeroed(8);
+        bitmap.set(1, true);
+        bitmap.set(4, true);
+        bitmap.set(5, true);
+        bitmap.set(7, true);
+        let bitmap: Bitmap = bitmap.into();
+        let selection = RowSelection::from(&bitmap);
+
+        let indices = row_selection_to_indices(&selection);
+
+        assert_eq!(indices, vec![1, 4, 5, 7]);
+    }
+
+    #[test]
+    fn test_remain_scan_mode() {
+        fn selection(bits: &[usize], len: usize) -> RowSelection {
+            let mut bitmap = MutableBitmap::from_len_zeroed(len);
+            for bit in bits {
+                bitmap.set(*bit, true);
             }
-            name_paths
+            let bitmap: Bitmap = bitmap.into();
+            RowSelection::from(&bitmap)
         }
+
+        assert!(matches!(
+            remain_scan_mode(&selection(&[1, 2], 16), 16, 25),
+            VortexRemainScanMode::Pushdown
+        ));
+        assert!(matches!(
+            remain_scan_mode(&selection(&[0, 1, 2, 3, 4], 8), 8, 25),
+            VortexRemainScanMode::FullScanFilter
+        ));
+        assert!(matches!(
+            remain_scan_mode(&selection(&[0, 1, 2], 10), 10, 20),
+            VortexRemainScanMode::FullScanFilter
+        ));
+        assert!(matches!(
+            remain_scan_mode(&selection(&[0, 1, 2], 10), 10, 30),
+            VortexRemainScanMode::Pushdown
+        ));
     }
 }

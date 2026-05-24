@@ -39,7 +39,6 @@ use crate::FuseTable;
 use crate::io::BlockReader;
 use crate::io::CompactSegmentInfoReader;
 use crate::io::MetaReaders;
-use databend_common_base::runtime::spawn_blocking;
 
 /// A Vortex-specific implementation of RowFetch.
 ///
@@ -172,13 +171,10 @@ impl RowsFetcher for VortexRowsFetcher {
                 expanded_positions.push(pos);
             }
 
-            plans.insert(
-                block_id,
-                BlockPlan {
-                    uniq_indices: uniq,
-                    expanded_positions,
-                },
-            );
+            plans.insert(block_id, BlockPlan {
+                uniq_indices: uniq,
+                expanded_positions,
+            });
         }
 
         // Build final_indices aligned with input order / multiplicity.
@@ -190,7 +186,9 @@ impl RowsFetcher for VortexRowsFetcher {
             let row_pos = *plan
                 .expanded_positions
                 .get(orig_pos as usize)
-                .ok_or_else(|| ErrorCode::Internal("rowfetch position out of bounds".to_string()))?;
+                .ok_or_else(|| {
+                    ErrorCode::Internal("rowfetch position out of bounds".to_string())
+                })?;
             final_indices.push((final_block_index[&block_id], row_pos));
         }
 
@@ -276,27 +274,23 @@ impl VortexRowsFetcher {
             // ScanBuilder requires sorted indices.
             uniq_indices.sort_unstable();
             uniq_indices.dedup();
-            let location = metadata.location.clone();
 
-            let block = spawn_blocking(move || {
-                reader.deserialize_vortex_chunks_with_scan_filter(
+            let block = reader
+                .read_block(
                     &metadata.location,
                     metadata.nums_rows,
-                    &metadata.columns_meta,
-                    std::collections::HashMap::new(),
-                    None,
                     None,
                     None,
                     Some(uniq_indices.as_slice()),
+                    None,
                 )
-            })
-            .await
-            .map_err(|e| {
-                ErrorCode::Internal(format!(
-                    "Vortex row fetch blocking task join failed for {}: {e}",
-                    location
-                ))
-            })??;
+                .await
+                .map_err(|e| {
+                    ErrorCode::Internal(format!(
+                        "Vortex row fetch async deserialize failed for {}: {}",
+                        metadata.location, e
+                    ))
+                })?;
             Ok((final_index, block))
         }
     }
@@ -337,4 +331,3 @@ fn build_metadata_vortex(meta: &[Arc<BlockMeta>]) -> Result<Vec<RowsFetchMetadat
     }
     Ok(out)
 }
-

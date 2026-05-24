@@ -326,9 +326,7 @@ impl StreamBlockBuilder {
                     properties.source_schema.clone(),
                 ))
             }
-            FuseStorageFormat::Vortex => {
-                BlockWriterImpl::Vortex(BufferedVortexWriter::new())
-            }
+            FuseStorageFormat::Vortex => BlockWriterImpl::Vortex(BufferedVortexWriter::new()),
             FuseStorageFormat::Native => {
                 let mut default_compress_ratio = Some(2.10f64);
                 if matches!(
@@ -452,13 +450,10 @@ impl StreamBlockBuilder {
     }
 
     pub fn finish(mut self) -> Result<BlockSerialization> {
-        let (block_location, block_id) = self
-            .properties
-            .meta_locations
-            .gen_block_location(
-                self.properties.table_meta_timestamps,
-                self.properties.write_settings.storage_format,
-            );
+        let (block_location, block_id) = self.properties.meta_locations.gen_block_location(
+            self.properties.table_meta_timestamps,
+            self.properties.write_settings.storage_format,
+        );
 
         let bloom_index_location = self
             .properties

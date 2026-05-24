@@ -36,6 +36,7 @@ use crate::FUSE_TBL_SEGMENT_STATISTICS_PREFIX;
 use crate::FUSE_TBL_SPATIAL_INDEX_PREFIX;
 use crate::FUSE_TBL_VECTOR_INDEX_PREFIX;
 use crate::FUSE_TBL_XOR_BLOOM_INDEX_PREFIX;
+use crate::FuseStorageFormat;
 use crate::LEGACY_FUSE_TBL_REF_PREFIX;
 use crate::constants::FUSE_TBL_BLOCK_PREFIX;
 use crate::constants::FUSE_TBL_SEGMENT_PREFIX;
@@ -45,7 +46,6 @@ use crate::constants::FUSE_TBL_VIRTUAL_BLOCK_PREFIX;
 use crate::constants::FUSE_TBL_VIRTUAL_BLOCK_PREFIX_V1;
 use crate::index::InvertedIndexFile;
 use crate::index::filters::BlockFilter;
-use crate::FuseStorageFormat;
 
 static SNAPSHOT_V0: SnapshotVersion = SnapshotVersion::V0(PhantomData);
 static SNAPSHOT_V1: SnapshotVersion = SnapshotVersion::V1(PhantomData);

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use databend_common_exception::Result;
 
@@ -22,6 +23,7 @@ use crate::runtime::Runtime;
 pub struct GlobalIORuntime;
 
 pub struct GlobalQueryRuntime(pub Runtime);
+pub struct GlobalVortexRuntime(pub Runtime);
 
 impl GlobalQueryRuntime {
     #[inline(always)]
@@ -30,16 +32,27 @@ impl GlobalQueryRuntime {
     }
 }
 
+impl GlobalVortexRuntime {
+    #[inline(always)]
+    pub fn runtime(self: &Arc<Self>) -> &Runtime {
+        &self.0
+    }
+}
+
 impl GlobalIORuntime {
     pub fn init(num_cpus: usize) -> Result<()> {
-        let thread_num = std::cmp::max(num_cpus, num_cpus::get() / 2);
-        let thread_num = std::cmp::max(2, thread_num);
+        static INIT: OnceLock<Result<()>> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let thread_num = std::cmp::max(num_cpus, num_cpus::get() / 2);
+            let thread_num = std::cmp::max(2, thread_num);
 
-        GlobalInstance::set(Arc::new(Runtime::with_worker_threads(
-            thread_num,
-            Some("IO-worker".to_owned()),
-        )?));
-        Ok(())
+            GlobalInstance::set(Arc::new(Runtime::with_worker_threads(
+                thread_num,
+                Some("IO-worker".to_owned()),
+            )?));
+            Ok(())
+        })
+        .clone()
     }
 
     pub fn instance() -> Arc<Runtime> {
@@ -61,3 +74,22 @@ impl GlobalQueryRuntime {
         GlobalInstance::get()
     }
 }
+
+impl GlobalVortexRuntime {
+    pub fn init(num_cpus: usize) -> Result<()> {
+        let thread_num = std::cmp::max(num_cpus, num_cpus::get() / 2);
+        let thread_num = std::cmp::max(2, thread_num);
+        let rt = Runtime::with_worker_threads(thread_num, Some("vortex-worker".to_owned()))?;
+        GlobalInstance::set(Arc::new(GlobalVortexRuntime(rt)));
+        Ok(())
+    }
+
+    pub fn instance() -> Arc<GlobalVortexRuntime> {
+        GlobalInstance::get()
+    }
+
+    pub fn try_instance() -> Option<Arc<GlobalVortexRuntime>> {
+        GlobalInstance::try_get()
+    }
+}
+
