@@ -21,8 +21,11 @@ use databend_storages_common_io::ReadSettings;
 use log::debug;
 
 use super::block_format::FuseBlockFormat;
+use super::block_format::FuseParquetBlockFormat;
+use super::block_format::FuseVortexBlockFormat;
 use super::native_data_source::NativeDataSource;
 use super::parquet_data_source::ParquetDataSource;
+use super::vortex_data_source::VortexDataSource;
 use super::raw_data_source::RawDataSource;
 use super::read_data_source::ReadDataSource;
 use crate::FuseBlockPartInfo;
@@ -79,16 +82,27 @@ impl ReadBlockContext {
             .as_ref()
             .and_then(|source| source.ignore_column_ids.clone());
 
-        let raw_data = self
-            .block_format
-            .read_data_by_merge_io(
+        let raw_data = if matches!(self.storage_format, FuseStorageFormat::Vortex) {
+            FuseVortexBlockFormat::read_data_by_merge_io_using_full_block_file(
                 &self.block_read_ctx,
                 &self.read_settings,
                 &fuse_part.location,
                 &fuse_part.columns_meta,
                 &ignore_column_ids,
+                fuse_part.block_file_size,
             )
-            .await?;
+            .await?
+        } else {
+            self.block_format
+                .read_data_by_merge_io(
+                    &self.block_read_ctx,
+                    &self.read_settings,
+                    &fuse_part.location,
+                    &fuse_part.columns_meta,
+                    &ignore_column_ids,
+                )
+                .await?
+        };
 
         Ok(match raw_data {
             RawDataSource::Native(data) => {
@@ -96,6 +110,9 @@ impl ReadBlockContext {
             }
             RawDataSource::Parquet(data) => {
                 ReadDataSource::Parquet(Box::new(ParquetDataSource::Normal((data, virtual_source))))
+            }
+            RawDataSource::Vortex(data) => {
+                ReadDataSource::Vortex(Box::new(VortexDataSource::Normal(data)))
             }
         })
     }
@@ -114,16 +131,21 @@ impl ReadBlockContext {
         );
         let index_block_read_ctx = index_reader.block_read_context();
 
-        let Some(block_meta) = self
-            .block_format
+        let index_block_format: Arc<dyn FuseBlockFormat> =
+            if matches!(self.storage_format, FuseStorageFormat::Vortex) {
+                FuseParquetBlockFormat::create()
+            } else {
+                self.block_format.clone()
+            };
+
+        let Some(block_meta) = index_block_format
             .read_block_meta(index_block_read_ctx.operator(), &location)
             .await
         else {
             return Ok(None);
         };
 
-        let raw_data = match self
-            .block_format
+        let raw_data = match index_block_format
             .read_data_by_merge_io(
                 &index_block_read_ctx,
                 &self.read_settings,
@@ -158,9 +180,18 @@ impl ReadBlockContext {
                     index_reader.compression().into(),
                     None,
                     None,
+                    0,
                     None,
                 );
-                ReadDataSource::Parquet(Box::new(ParquetDataSource::AggIndex((part, data))))
+                if matches!(self.storage_format, FuseStorageFormat::Vortex) {
+                    ReadDataSource::Vortex(Box::new(VortexDataSource::AggIndex((part, data))))
+                } else {
+                    ReadDataSource::Parquet(Box::new(ParquetDataSource::AggIndex((part, data))))
+                }
+            }
+            RawDataSource::Vortex(_) => {
+                debug!("Read aggregating index `{location}`: unexpected vortex raw layout");
+                return Ok(None);
             }
         }))
     }

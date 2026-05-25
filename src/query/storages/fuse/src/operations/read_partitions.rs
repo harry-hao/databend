@@ -1114,6 +1114,7 @@ impl FuseTable {
             meta.compression(),
             sort_min_max,
             block_meta_index.to_owned(),
+            meta.file_size,
             create_on,
         )
     }
@@ -1179,6 +1180,7 @@ impl FuseTable {
             meta.compression(),
             sort_min_max,
             block_meta_index.to_owned(),
+            meta.file_size,
             create_on,
         )
     }

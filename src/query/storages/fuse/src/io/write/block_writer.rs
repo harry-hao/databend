@@ -108,6 +108,15 @@ pub fn serialize_block_with_column_stats(
             let meta = column_parquet_metas(&result, &schema)?;
             Ok(meta)
         }
+        FuseStorageFormat::Vortex => {
+            let (encoded, meta) = super::vortex_encode::encode_data_blocks_as_vortex(
+                &schema,
+                std::slice::from_ref(&block),
+            )?;
+            buf.clear();
+            buf.extend_from_slice(&encoded);
+            Ok(meta)
+        }
         FuseStorageFormat::Native => {
             let leaf_column_ids = schema.to_leaf_column_ids();
 
@@ -201,9 +210,10 @@ impl BlockBuilder {
     where F: Fn(DataBlock, &ClusterStatsGenerator) -> Result<(Option<ClusterStatistics>, DataBlock)>
     {
         let (cluster_stats, data_block) = f(data_block, &self.cluster_stats_gen)?;
-        let (block_location, block_id) = self
-            .meta_locations
-            .gen_block_location(self.table_meta_timestamps);
+        let (block_location, block_id) = self.meta_locations.gen_block_location(
+            self.table_meta_timestamps,
+            self.write_settings.storage_format,
+        );
 
         let bloom_index_location = self.meta_locations.block_bloom_index_location(&block_id);
         let bloom_index_state = BloomIndexState::from_data_block(

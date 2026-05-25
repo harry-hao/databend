@@ -34,12 +34,14 @@ use databend_common_storage::ColumnNodes;
 use opendal::Operator;
 
 use crate::BlockReadResult;
+use crate::FuseStorageFormat;
 
 // TODO: make BlockReader as a trait.
 #[derive(Clone)]
 pub struct BlockReader {
     pub(crate) ctx: Arc<dyn TableContext>,
     pub(crate) operator: Operator,
+    pub(crate) storage_format: FuseStorageFormat,
     pub(crate) projection: Projection,
     pub(crate) projected_schema: TableSchemaRef,
     pub(crate) project_indices: Arc<BTreeMap<FieldIndex, (ColumnId, Field, DataType)>>,
@@ -128,6 +130,7 @@ impl BlockReader {
     fn build_reader(
         ctx: Arc<dyn TableContext>,
         operator: Operator,
+        storage_format: FuseStorageFormat,
         original_schema: TableSchemaRef,
         all_field_default_vals: Vec<Scalar>,
         projection: Projection,
@@ -154,6 +157,7 @@ impl BlockReader {
         Ok(Arc::new(BlockReader {
             ctx,
             operator,
+            storage_format,
             projection,
             projected_schema,
             project_indices,
@@ -172,6 +176,7 @@ impl BlockReader {
         ctx: Arc<dyn TableContext>,
         operator: Operator,
         schema: TableSchemaRef,
+        storage_format: FuseStorageFormat,
         projection: Projection,
         query_internal_columns: bool,
         update_stream_columns: bool,
@@ -186,6 +191,7 @@ impl BlockReader {
         Self::build_reader(
             ctx,
             operator,
+            storage_format,
             schema,
             all_field_default_vals,
             projection,
@@ -199,6 +205,7 @@ impl BlockReader {
         Self::build_reader(
             self.ctx.clone(),
             self.operator.clone(),
+            self.storage_format,
             self.original_schema.clone(),
             self.all_field_default_vals.clone(),
             projection,

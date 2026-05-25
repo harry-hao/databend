@@ -111,6 +111,7 @@ impl MatchedAggregator {
                 ctx.clone(),
                 data_accessor.clone(),
                 target_table_schema.clone(),
+                table.get_storage_format(),
                 projection,
                 false,
                 update_stream_columns,

@@ -14,12 +14,13 @@
 
 use std::collections::HashMap;
 
-use arrow_array::Array;
 use arrow_array::ArrayRef;
 use arrow_array::RecordBatch;
 use arrow_array::StructArray;
+use arrow_select::filter::filter_record_batch;
 use databend_common_catalog::plan::Projection;
 use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 use databend_common_expression::BlockEntry;
 use databend_common_expression::ColumnId;
 use databend_common_expression::DataBlock;
@@ -27,75 +28,33 @@ use databend_common_expression::FilterVisitor;
 use databend_common_expression::TableDataType;
 use databend_common_expression::TableSchema;
 use databend_common_expression::Value;
+use databend_common_expression::types::Bitmap;
 use databend_common_expression::visitor::ValueVisitor;
-use databend_storages_common_cache::CacheAccessor;
-use databend_storages_common_cache::CacheManager;
-use databend_storages_common_cache::TableDataCacheKey;
 use databend_storages_common_table_meta::meta::ColumnMeta;
-use databend_storages_common_table_meta::meta::Compression;
-mod adapter;
-mod deserialize;
-mod row_selection;
+use vortex::arrow::IntoArrowArray;
+use vortex::iter::ArrayIteratorExt;
+use vortex::file::OpenOptionsSessionExt;
+use vortex::io::runtime::BlockingRuntime;
+use vortex::io::runtime::single::SingleThreadRuntime;
+use vortex::io::session::RuntimeSessionExt;
+use vortex::session::VortexSession;
+use vortex::VortexSessionDefault;
 
-pub use adapter::RowGroupImplBuilder;
-pub use deserialize::column_chunks_to_record_batch;
-pub use row_selection::RowSelection;
-
-use crate::FuseBlockPartInfo;
-use crate::FuseStorageFormat;
+use super::parquet::RowSelection;
 use crate::io::BlockReader;
 use crate::io::read::block::block_reader_merge_io::DataItem;
 
 impl BlockReader {
-    pub fn deserialize_part(
-        &self,
-        part: &FuseBlockPartInfo,
-        column_chunks: HashMap<ColumnId, DataItem>,
-        selection: Option<&RowSelection>,
-    ) -> databend_common_exception::Result<DataBlock> {
-        match self.storage_format {
-            FuseStorageFormat::Parquet => self.deserialize_parquet_chunks(
-                part.nums_rows,
-                &part.columns_meta,
-                column_chunks,
-                &part.compression,
-                &part.location,
-                selection,
-            ),
-            FuseStorageFormat::Native => {
-                if selection.is_some() {
-                    return Err(ErrorCode::Unimplemented(
-                        "FUSE native format does not support row selection in deserialize_part"
-                            .to_string(),
-                    ));
-                }
-                self.deserialize_native_chunks(
-                    &part.location,
-                    part.nums_rows,
-                    &part.columns_meta,
-                    column_chunks,
-                )
-            }
-            FuseStorageFormat::Vortex => self.deserialize_vortex_chunks(
-                part.nums_rows,
-                &part.columns_meta,
-                column_chunks,
-                selection,
-            ),
-        }
-    }
-
-    pub fn deserialize_parquet_chunks(
+    /// Deserialize one FUSE block stored as a single Vortex file (see `encode_data_blocks_as_vortex`).
+    pub fn deserialize_vortex_chunks(
         &self,
         num_rows: usize,
-        column_metas: &HashMap<ColumnId, ColumnMeta>,
+        _column_metas: &HashMap<ColumnId, ColumnMeta>,
         column_chunks: HashMap<ColumnId, DataItem>,
-        compression: &Compression,
-        block_path: &str,
         selection: Option<&RowSelection>,
-    ) -> databend_common_exception::Result<DataBlock> {
+    ) -> Result<DataBlock> {
         let result_rows = selection.map(|s| s.selected_rows).unwrap_or(num_rows);
-        // If projection is empty, return a DataBlock with the appropriate row count but no columns
+
         if self.projected_schema.fields.is_empty() {
             return Ok(DataBlock::empty_with_rows(result_rows));
         }
@@ -104,24 +63,28 @@ impl BlockReader {
             return Ok(DataBlock::empty_with_schema(&self.data_schema()));
         }
 
-        let has_selection = selection.is_some();
-        let parquet_selection = selection.map(|s| s.selection.clone());
-        let record_batch = column_chunks_to_record_batch(
-            &self.original_schema,
-            num_rows,
-            &column_chunks,
-            compression,
-            parquet_selection,
-        )?;
-        let mut entries = Vec::with_capacity(self.projected_schema.fields.len());
+        let vortex_bytes = first_raw_vortex_bytes(&column_chunks)?;
+        let mut record_batch = decode_vortex_bytes_to_record_batch(&vortex_bytes)?;
+
+        if record_batch.num_rows() != num_rows {
+            return Err(ErrorCode::BadBytes(format!(
+                "FUSE storage_format='vortex' row count mismatch: metadata {num_rows}, decoded {}",
+                record_batch.num_rows()
+            )));
+        }
+
+        if let Some(selection) = selection {
+            let predicate = bitmap_to_boolean_array(&selection.bitmap)?;
+            record_batch = filter_record_batch(&record_batch, &predicate).map_err(|e| {
+                ErrorCode::BadBytes(format!(
+                    "FUSE storage_format='vortex' failed to apply row filter: {e}"
+                ))
+            })?;
+        }
+
         let name_paths = column_name_paths(&self.projection, &self.original_schema);
 
-        let array_cache = if self.put_cache && !has_selection {
-            CacheManager::instance().get_table_data_array_cache()
-        } else {
-            None
-        };
-
+        let mut entries = Vec::with_capacity(self.projected_schema.fields.len());
         for ((i, field), column_node) in self
             .projected_schema
             .fields
@@ -131,41 +94,20 @@ impl BlockReader {
         {
             let data_type = field.data_type().into();
 
-            // NOTE, there is something tricky here:
-            // - `column_chunks` always contains data of leaf columns
-            // - here we may processing a nested type field
-            // - But, even if the field being processed is a field with multiple leaf columns
-            //    `column_chunks.get(&field.column_id)` will still return Some(DataItem::_)[^1],
-            //    even if we are getting data from `column_chunks` using a non-leaf
-            //    `column_id` of `projected_schema.fields`
-            //
-            //   [^1]: Except in the current block, there is no data stored for the
-            //         corresponding field, and a default value has been declared for
-            //         the corresponding field.
-            //
-            //  Yes, it is too obscure, we need to polish it later.
-
             let value = match column_chunks.get(&field.column_id) {
                 Some(DataItem::RawData(_)) => {
-                    // get the deserialized arrow array, which may be a nested array
                     let arrow_array = column_by_name(&record_batch, &name_paths[i]);
-                    if !column_node.is_nested {
-                        if let Some(cache) = &array_cache {
-                            let meta = column_metas.get(&field.column_id).unwrap();
-                            let (offset, len) = meta.offset_length();
-                            let key =
-                                TableDataCacheKey::new(block_path, field.column_id, offset, len);
-                            let array_memory_size = arrow_array.get_array_memory_size();
-                            cache.insert(key.into(), (arrow_array.clone(), array_memory_size));
-                        }
+                    if column_node.is_nested {
+                        return Err(ErrorCode::StorageOther(
+                            "FUSE storage_format='vortex' nested projection is not supported yet",
+                        ));
                     }
                     Value::from_arrow_rs(arrow_array, &data_type)?
                 }
                 Some(DataItem::ColumnArray(cached)) => {
                     if column_node.is_nested {
-                        // a defensive check, should never happen
                         return Err(ErrorCode::StorageOther(
-                            "unexpected nested field: nested leaf field hits cached",
+                            "unexpected nested field: nested leaf field hits cached (vortex)",
                         ));
                     }
                     let mut value = Value::from_arrow_rs(cached.0.clone(), &data_type)?;
@@ -184,6 +126,78 @@ impl BlockReader {
     }
 }
 
+fn first_raw_vortex_bytes(column_chunks: &HashMap<ColumnId, DataItem>) -> Result<Vec<u8>> {
+    for (_, item) in column_chunks {
+        if let DataItem::RawData(buf) = item {
+            return Ok(buf.to_vec());
+        }
+    }
+    Err(ErrorCode::BadBytes(
+        "FUSE storage_format='vortex' missing raw column bytes".to_string(),
+    ))
+}
+
+fn decode_vortex_bytes_to_record_batch(bytes: &[u8]) -> Result<RecordBatch> {
+    let rt = SingleThreadRuntime::default();
+    let session = VortexSession::default().with_handle(rt.handle());
+    let file = session
+        .open_options()
+        .open_buffer(bytes.to_vec())
+        .map_err(|e| {
+            ErrorCode::BadBytes(format!(
+                "FUSE storage_format='vortex' failed to open Vortex buffer: {e}"
+            ))
+        })?;
+    let array_ref = file
+        .scan()
+        .map_err(|e| {
+            ErrorCode::BadBytes(format!(
+                "FUSE storage_format='vortex' failed to begin scan: {e}"
+            ))
+        })?
+        .into_array_iter(&rt)
+        .map_err(|e| {
+            ErrorCode::BadBytes(format!(
+                "FUSE storage_format='vortex' failed to build scan iterator: {e}"
+            ))
+        })?
+        .read_all()
+        .map_err(|e| {
+            ErrorCode::BadBytes(format!(
+                "FUSE storage_format='vortex' failed to read arrays: {e}"
+            ))
+        })?;
+
+    record_batch_from_vortex_root(array_ref)
+}
+
+fn record_batch_from_vortex_root(array_ref: vortex::ArrayRef) -> Result<RecordBatch> {
+    if let Ok(rb) = RecordBatch::try_from(array_ref.as_ref()) {
+        return Ok(rb);
+    }
+    let arrow = array_ref.into_arrow_preferred().map_err(|e| {
+        ErrorCode::BadBytes(format!(
+            "FUSE storage_format='vortex' could not convert root array to Arrow: {e}"
+        ))
+    })?;
+    let struct_array = arrow
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            ErrorCode::BadBytes(
+                "FUSE storage_format='vortex' expected struct-typed root Arrow array".to_string(),
+            )
+        })?;
+    Ok(RecordBatch::from(struct_array.clone()))
+}
+
+fn bitmap_to_boolean_array(bitmap: &Bitmap) -> Result<arrow_array::BooleanArray> {
+    let values: Vec<bool> = (0..bitmap.len())
+        .map(|i| unsafe { bitmap.get_bit_unchecked(i) })
+        .collect();
+    Ok(arrow_array::BooleanArray::from(values))
+}
+
 fn column_by_name(record_batch: &RecordBatch, names: &[String]) -> ArrayRef {
     let mut array = record_batch.column_by_name(&names[0]).unwrap().clone();
     if names.len() > 1 {
@@ -195,7 +209,6 @@ fn column_by_name(record_batch: &RecordBatch, names: &[String]) -> ArrayRef {
     array
 }
 
-// This function assumes that projection is valid, isn't responsible for checking it.
 fn column_name_paths(projection: &Projection, schema: &TableSchema) -> Vec<Vec<String>> {
     match projection {
         Projection::Columns(field_indices) => field_indices

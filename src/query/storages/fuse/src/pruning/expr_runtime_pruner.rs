@@ -386,6 +386,7 @@ mod tests {
             Compression::Lz4Raw,
             None,
             None,
+            0,
             None,
         )
     }
@@ -552,6 +553,7 @@ mod tests {
             Compression::Lz4Raw,
             None,
             None,
+            0,
             None,
         )
     }

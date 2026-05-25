@@ -321,14 +321,23 @@ impl ParquetRowsFetcher {
         chunk: BlockReadResult,
     ) -> Result<DataBlock> {
         let columns_chunks = chunk.columns_chunks()?;
-        reader.deserialize_parquet_chunks(
-            metadata.nums_rows,
-            &metadata.columns_meta,
-            columns_chunks,
-            &metadata.compression,
-            &metadata.location,
-            None,
-        )
+        let fuse_part = FuseBlockPartInfo {
+            location: metadata.location.clone(),
+            bloom_filter_index_location: None,
+            bloom_filter_index_size: 0,
+            spatial_index_location: None,
+            spatial_index_size: 0,
+            create_on: None,
+            nums_rows: metadata.nums_rows,
+            columns_meta: metadata.columns_meta.clone(),
+            columns_stat: None,
+            spatial_stats: None,
+            compression: metadata.compression,
+            sort_min_max: None,
+            block_meta_index: None,
+            block_file_size: 0,
+        };
+        reader.deserialize_part(&fuse_part, columns_chunks, None)
     }
 }
 

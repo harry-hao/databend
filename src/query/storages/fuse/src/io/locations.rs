@@ -45,6 +45,7 @@ use crate::constants::FUSE_TBL_VIRTUAL_BLOCK_PREFIX;
 use crate::constants::FUSE_TBL_VIRTUAL_BLOCK_PREFIX_V1;
 use crate::index::InvertedIndexFile;
 use crate::index::filters::BlockFilter;
+use crate::FuseStorageFormat;
 
 static SNAPSHOT_V0: SnapshotVersion = SnapshotVersion::V0(PhantomData);
 static SNAPSHOT_V1: SnapshotVersion = SnapshotVersion::V1(PhantomData);
@@ -149,14 +150,20 @@ impl TableMetaLocationGenerator {
     pub fn gen_block_location(
         &self,
         table_meta_timestamps: TableMetaTimestamps,
+        storage_format: FuseStorageFormat,
     ) -> (Location, Uuid) {
         let part_uuid = uuid_from_date_time(table_meta_timestamps.segment_block_timestamp);
+        let suffix = match storage_format {
+            FuseStorageFormat::Vortex => "vortex",
+            FuseStorageFormat::Parquet | FuseStorageFormat::Native => "parquet",
+        };
         let location_path = format!(
-            "{}{}{}_v{}.parquet",
+            "{}{}{}_v{}.{}",
             self.block_location_prefix(),
             VACUUM2_OBJECT_KEY_PREFIX,
             part_uuid.as_simple(),
             DataBlock::VERSION,
+            suffix,
         );
 
         ((location_path, DataBlock::VERSION), part_uuid)

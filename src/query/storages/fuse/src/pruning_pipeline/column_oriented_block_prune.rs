@@ -275,6 +275,7 @@ impl AsyncSink for ColumnOrientedBlockPruneSink {
                         compression,
                         None, // TODO(Sky): sort_min_max
                         Some(block_meta_index),
+                        block_size,
                         create_on,
                     );
 

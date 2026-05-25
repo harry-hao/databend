@@ -14,6 +14,7 @@
 
 mod block_statistics_writer;
 mod block_writer;
+mod vortex_encode;
 mod bloom_index_writer;
 mod inverted_index_writer;
 mod meta_writer;

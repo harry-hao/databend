@@ -334,6 +334,8 @@ impl SegmentInfo {
 pub enum ColumnMeta {
     Parquet(v0::ColumnMeta),
     Native(NativeColumnMeta),
+    /// Column byte range within a Vortex-encoded FUSE data block.
+    Vortex(v0::ColumnMeta),
 }
 
 impl ColumnMeta {
@@ -341,6 +343,7 @@ impl ColumnMeta {
         match self {
             ColumnMeta::Parquet(v) => v.num_values as usize,
             ColumnMeta::Native(v) => v.pages.iter().map(|page| page.num_values as usize).sum(),
+            ColumnMeta::Vortex(v) => v.num_values as usize,
         }
     }
 
@@ -348,12 +351,14 @@ impl ColumnMeta {
         match self {
             ColumnMeta::Parquet(v) => (v.offset, v.len),
             ColumnMeta::Native(v) => (v.offset, v.pages.iter().map(|page| page.length).sum()),
+            ColumnMeta::Vortex(v) => (v.offset, v.len),
         }
     }
 
     pub fn read_rows(&self, range: Option<&Range<usize>>) -> u64 {
         match self {
             ColumnMeta::Parquet(v) => v.num_values,
+            ColumnMeta::Vortex(v) => v.num_values,
             ColumnMeta::Native(v) => match range {
                 Some(range) => v
                     .pages
@@ -370,6 +375,7 @@ impl ColumnMeta {
     pub fn read_bytes(&self, range: &Option<Range<usize>>) -> u64 {
         match self {
             ColumnMeta::Parquet(v) => v.len,
+            ColumnMeta::Vortex(v) => v.len,
             ColumnMeta::Native(v) => match range {
                 Some(range) => v
                     .pages

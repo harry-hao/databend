@@ -75,6 +75,7 @@ use crate::io::write::stream::ColumnStatisticsState;
 use crate::io::write::stream::block_builder::ArrowParquetWriter::Initialized;
 use crate::io::write::stream::cluster_statistics::ClusterStatisticsBuilder;
 use crate::io::write::stream::cluster_statistics::ClusterStatisticsState;
+use crate::io::write::vortex_encode;
 use crate::operations::column_parquet_metas;
 
 pub struct UninitializedArrowWriter {
@@ -169,6 +170,27 @@ pub enum BlockWriterImpl {
     Parquet(ArrowParquetWriter),
     // Native format doesnot support stream write.
     Native(NativeWriter<Vec<u8>>),
+    /// Buffers `DataBlock`s and encodes them as one Vortex file on `finish`.
+    Vortex(BufferedVortexWriter),
+}
+
+/// Stream writer for Vortex: accumulate `DataBlock`s; on `finish` the Vortex crate consumes them
+/// as a chunked [`vortex::iter::ArrayIterator`] (no `concat_batches` merge) via
+/// `write_options().blocking().write` inside `encode_data_blocks_as_vortex`.
+pub struct BufferedVortexWriter {
+    buffer: Vec<u8>,
+    blocks: Vec<DataBlock>,
+    est_compressed: usize,
+}
+
+impl BufferedVortexWriter {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::with_capacity(DEFAULT_BLOCK_BUFFER_SIZE),
+            blocks: Vec::new(),
+            est_compressed: 0,
+        }
+    }
 }
 
 pub trait BlockWriter {
@@ -198,6 +220,9 @@ impl BlockWriter for BlockWriterImpl {
                 Ok(())
             }
             BlockWriterImpl::Native(native_writer) => Ok(native_writer.start()?),
+            // Vortex encoding is driven from `finish()` via `encode_data_blocks_as_vortex` (streaming
+            // chunk iterator into the Vortex writer). No Parquet-style `ArrowWriter::try_new` step.
+            BlockWriterImpl::Vortex(_) => Ok(()),
         }
     }
 
@@ -215,6 +240,10 @@ impl BlockWriter for BlockWriterImpl {
                     .map(|x| x.into_column().unwrap())
                     .collect();
                 writer.write(&batch)?;
+            }
+            BlockWriterImpl::Vortex(writer) => {
+                writer.est_compressed += block.estimate_block_size();
+                writer.blocks.push(block);
             }
         }
         Ok(())
@@ -237,6 +266,13 @@ impl BlockWriter for BlockWriterImpl {
                 }
                 Ok(metas)
             }
+            BlockWriterImpl::Vortex(writer) => {
+                let (encoded, metas) =
+                    vortex_encode::encode_data_blocks_as_vortex(schema, &writer.blocks)?;
+                writer.buffer.clear();
+                writer.buffer.extend_from_slice(&encoded);
+                Ok(metas)
+            }
         }
     }
 
@@ -244,6 +280,7 @@ impl BlockWriter for BlockWriterImpl {
         match self {
             BlockWriterImpl::Parquet(writer) => writer.inner_mut(),
             BlockWriterImpl::Native(writer) => writer.inner_mut(),
+            BlockWriterImpl::Vortex(writer) => &mut writer.buffer,
         }
     }
 
@@ -251,6 +288,13 @@ impl BlockWriter for BlockWriterImpl {
         match self {
             BlockWriterImpl::Parquet(writer) => writer.in_progress_size(),
             BlockWriterImpl::Native(writer) => writer.total_size(),
+            BlockWriterImpl::Vortex(writer) => {
+                if !writer.buffer.is_empty() {
+                    writer.buffer.len()
+                } else {
+                    writer.est_compressed
+                }
+            }
         }
     }
 }
@@ -281,6 +325,9 @@ impl StreamBlockBuilder {
                     properties.write_settings.clone(),
                     properties.source_schema.clone(),
                 ))
+            }
+            FuseStorageFormat::Vortex => {
+                BlockWriterImpl::Vortex(BufferedVortexWriter::new())
             }
             FuseStorageFormat::Native => {
                 let mut default_compress_ratio = Some(2.10f64);
@@ -408,7 +455,10 @@ impl StreamBlockBuilder {
         let (block_location, block_id) = self
             .properties
             .meta_locations
-            .gen_block_location(self.properties.table_meta_timestamps);
+            .gen_block_location(
+                self.properties.table_meta_timestamps,
+                self.properties.write_settings.storage_format,
+            );
 
         let bloom_index_location = self
             .properties

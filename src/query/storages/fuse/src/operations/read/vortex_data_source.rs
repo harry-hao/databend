@@ -12,21 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod block_reader;
-mod block_reader_deserialize;
-pub mod block_reader_merge_io;
-mod block_reader_merge_io_async;
-mod block_reader_native;
-mod block_reader_native_deserialize;
-mod block_reader_parquet_deserialize;
-pub mod parquet;
-mod vortex_deserialize;
+use databend_common_catalog::plan::PartInfoPtr;
 
-pub use block_reader::BlockReadContext;
-pub use block_reader::BlockReader;
-pub use block_reader_merge_io::BlockReadResult;
-pub use block_reader_merge_io::DataItem;
-pub use block_reader_native::NativeReaderExt;
-pub use block_reader_native::NativeSourceData;
-pub use parquet::RowSelection;
-pub use parquet::column_chunks_to_record_batch;
+use crate::io::BlockReadResult;
+
+pub enum VortexDataSource {
+    AggIndex((PartInfoPtr, BlockReadResult)),
+    Normal(BlockReadResult),
+}

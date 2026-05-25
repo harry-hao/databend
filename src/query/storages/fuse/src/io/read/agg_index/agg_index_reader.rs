@@ -31,6 +31,7 @@ use databend_storages_common_table_meta::table::TableCompression;
 use opendal::Operator;
 
 use crate::io::BlockReadContext;
+use crate::FuseStorageFormat;
 use crate::io::BlockReader;
 
 #[derive(Clone)]
@@ -63,6 +64,7 @@ impl AggIndexReader {
             ctx.clone(),
             dal,
             agg.schema.clone(),
+            FuseStorageFormat::Parquet,
             agg.projection.clone(),
             false,
             false,

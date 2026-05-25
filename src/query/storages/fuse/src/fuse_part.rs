@@ -55,6 +55,9 @@ pub struct FuseBlockPartInfo {
 
     pub sort_min_max: Option<(Scalar, Scalar)>,
     pub block_meta_index: Option<BlockMetaIndex>,
+    /// On-disk size of the block file (Parquet / Vortex), used for full-file merge IO when set.
+    #[serde(default)]
+    pub block_file_size: u64,
 }
 
 #[typetag::serde(name = "fuse")]
@@ -95,6 +98,7 @@ impl FuseBlockPartInfo {
         compression: Compression,
         sort_min_max: Option<(Scalar, Scalar)>,
         block_meta_index: Option<BlockMetaIndex>,
+        block_file_size: u64,
         create_on: Option<DateTime<Utc>>,
     ) -> Arc<Box<dyn PartInfo>> {
         Arc::new(Box::new(FuseBlockPartInfo {
@@ -109,6 +113,7 @@ impl FuseBlockPartInfo {
             compression,
             sort_min_max,
             block_meta_index,
+            block_file_size,
             columns_stat,
             spatial_stats,
         }))

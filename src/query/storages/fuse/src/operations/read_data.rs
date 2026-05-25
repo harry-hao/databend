@@ -46,6 +46,7 @@ impl FuseTable {
             ctx,
             self.operator.clone(),
             table_schema,
+            self.get_storage_format(),
             projection,
             query_internal_columns,
             update_stream_columns,

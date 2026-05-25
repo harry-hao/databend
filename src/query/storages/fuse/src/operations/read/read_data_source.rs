@@ -18,11 +18,13 @@ use databend_common_expression::BlockMetaInfo;
 
 use super::native_data_source::NativeDataSource;
 use super::parquet_data_source::ParquetDataSource;
+use super::vortex_data_source::VortexDataSource;
 use crate::operations::read::data_source_with_meta::DataSourceWithMeta;
 
 pub enum ReadDataSource {
     Native(Box<NativeDataSource>),
     Parquet(Box<ParquetDataSource>),
+    Vortex(Box<VortexDataSource>),
 }
 
 impl ReadDataSource {
@@ -32,6 +34,9 @@ impl ReadDataSource {
             ReadDataSource::Parquet(_) => Err(ErrorCode::Internal(
                 "NativeDeserializeDataTransform got parquet data source",
             )),
+            ReadDataSource::Vortex(_) => Err(ErrorCode::Internal(
+                "NativeDeserializeDataTransform got vortex data source",
+            )),
         }
     }
 
@@ -40,6 +45,21 @@ impl ReadDataSource {
             ReadDataSource::Parquet(data) => Ok(*data),
             ReadDataSource::Native(_) => Err(ErrorCode::Internal(
                 "DeserializeDataTransform got native data source",
+            )),
+            ReadDataSource::Vortex(_) => Err(ErrorCode::Internal(
+                "DeserializeDataTransform got vortex data source",
+            )),
+        }
+    }
+
+    pub fn into_vortex(self) -> Result<VortexDataSource> {
+        match self {
+            ReadDataSource::Vortex(data) => Ok(*data),
+            ReadDataSource::Native(_) => Err(ErrorCode::Internal(
+                "VortexDeserializeDataTransform got native data source",
+            )),
+            ReadDataSource::Parquet(_) => Err(ErrorCode::Internal(
+                "VortexDeserializeDataTransform got parquet data source",
             )),
         }
     }
