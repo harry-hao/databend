@@ -82,7 +82,7 @@ impl<'a> BlockWriter<'a> {
             location_generator.gen_block_location(self.table_meta_timestamps)
         } else {
             self.location_generator
-                .gen_block_location(self.table_meta_timestamps)
+                .gen_block_location(self.table_meta_timestamps, storage_format)
         };
 
         let data_accessor = &self.data_accessor;

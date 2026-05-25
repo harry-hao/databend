@@ -750,8 +750,10 @@ impl CompactSegmentTestFixture {
                         })
                     };
 
-                    let (location, _) = location_gen
-                        .gen_block_location(TestFixture::default_table_meta_timestamps());
+                    let (location, _) = location_gen.gen_block_location(
+                        TestFixture::default_table_meta_timestamps(),
+                        FuseStorageFormat::Parquet,
+                    );
                     let row_count = block.num_rows() as u64;
                     let block_size = block.memory_size() as u64;
 

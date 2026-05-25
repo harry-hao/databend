@@ -178,6 +178,7 @@ async fn test_spatial_runtime_filter_pruner() -> anyhow::Result<()> {
         Compression::Lz4Raw,
         None,
         None,
+        0,
         None,
     );
 
